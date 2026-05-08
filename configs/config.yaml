@@ -1,0 +1,238 @@
+#============================================================
+#  南极冰山检测与实例分割 —— 全局配置文件
+#  所有超参数、路径均在此统一管理，禁止在代码中硬编码路径/数值
+# ============================================================
+
+# ──────────────────────────────────────────
+# 0. Python 环境（备注，不由代码读取）
+#    conda 环境: si-stsar
+#    Python    : F:/Software/Miniconda/envs/si-stsar/python.exe
+#    torch     : 2.5.1+cu121  |  torchvision: 0.20.1+cu121
+# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────
+# 1. 项目基础路径（所有相对路径均以 project_root 为基准）
+# ──────────────────────────────────────────
+project_root: "/content/drive/MyDrive/Iceberg-Detection"
+
+paths:
+  # 原始数据（支持单目录字符串或多目录列表）
+  raw_sar_dirs:
+    - "/content/drive/MyDrive/HH_201810_Mosaic"
+    - "/content/drive/MyDrive/HH_201910_Mosaic"   # 追加更多目录
+    - "/content/drive/MyDrive/HH_202010_Mosaic"
+    - "/content/drive/MyDrive/HH_202110_Mosaic"
+    - "/content/drive/MyDrive/HH_202210_Mosaic"
+    - "/content/drive/MyDrive/HH_202310_Mosaic"
+  raw_vector_dir:   "data/raw/vectors"      # .gpkg 矢量轮廓存放目录
+
+  # 预处理后的切片数据
+  processed_dir:    "data/processed"
+  patch_image_dir:  "data/processed/images" # 切好的图像块 (.npy)
+  patch_mask_dir:   "data/processed/masks"  # 对应的掩膜块 (.npy)
+  split_dir:        "data/processed/splits" # train/val/test 划分列表 (.csv)
+
+  # HDF5 打包数据（由 data_prep/pack_hdf5.py 生成）
+  hdf5_dir:         "/content/hdf5"   # train.h5 / val.h5 / test.h5 所在目录
+
+  # 输出
+  checkpoint_dir:   "outputs/checkpoints"   # 模型权重保存目录
+  log_dir:          "outputs/logs"          # TensorBoard / 文本日志目录
+  prediction_dir:   "outputs/predictions"   # 推理结果保存目录
+
+# ──────────────────────────────────────────
+# 2. 数据预处理参数 (data_prep)
+# ──────────────────────────────────────────
+data_prep:
+  patch_size: 512           # 切片大小（像素），正方形
+  overlap: 64               # 相邻切片重叠像素数（用于避免边界效应）
+  min_iceberg_pixels: 10    # 掩膜中冰山像素数低于此值的切片将被丢弃
+                            # 数据集最小冰山 ~0.04km²≈25px，原50会丢弃小目标正样本
+  target_crs: "EPSG:3031"   # 目标坐标系（南极极射赤面投影）
+  vector_burn_value: 1      # 矢量烧录到掩膜时的像素值（前景=1，背景=0）
+  nodata_value: 0           # SAR 影像无数据区域的填充值
+  sar_bands: [1]            # 使用的 SAR 波段索引列表（从1开始）
+  target_resolution: 40     # 重投影后目标分辨率（米），None 则保持原始分辨率
+  max_nan_ratio: 0.3        # 切片中 NaN 像素比例超过此值则丢弃
+  resume_enabled: false     # 场景级断点续跑：true 时跳过已完成场景
+  resume_verify_files: true # 启用后会校验完成标记与已保存切片数是否一致
+  spatial_buffer_m: 0       # 空间过滤时对 SAR 边界框的扩展缓冲（米）。
+                            # 当 SAR 边界与矢量几乎不重叠时可设置为 5000–50000 进行测试，
+                            # 正式训练时保持 0（避免掩膜错位）。
+  normalize:
+    method: "db_clip"       # 归一化方式: "db_clip"（推荐）| "minmax" | "percentile"
+                            # db_clip: 全局截断 [db_clip_min, db_clip_max] dB 后线性映射到 [0,1]
+                            # 禁止使用 minmax（逐切片拉伸会破坏 dB 绝对物理意义，放大海面噪声）
+    db_clip_min: -30.0      # 截断下限（dB）：覆盖 p01=-27dB，消除 -131dB 等极端噪声
+    db_clip_max: 5.0        # 截断上限（dB）：实测 max=+6.3dB，保留最亮冰山目标
+    percentile_low: 2       # 仅 percentile 方式使用
+    percentile_high: 98     # 仅 percentile 方式使用
+
+  # 数据集划分比例
+  split_ratio:
+    train: 0.70
+    val:   0.15
+    test:  0.15
+  random_seed: 42
+
+# ──────────────────────────────────────────
+# 3. 数据集与数据加载参数 (datasets)
+# ──────────────────────────────────────────
+dataset:
+  num_classes: 2            # 类别数: 0=背景, 1=冰山（可扩展）
+  input_channels: 1         # 输入通道数（单极化 SAR = 1，双极化 = 2）
+  image_size: 512           # 送入模型的图像尺寸（可与 patch_size 不同，会自动缩放）
+
+  # 数据增强（仅训练集启用）
+  augmentation:
+    enabled: true
+    horizontal_flip_prob: 0.5
+    vertical_flip_prob: 0.5
+    rotation_limit: 45       # 随机旋转最大角度（度）
+    scale_limit: 0.2         # 随机缩放幅度
+    elastic_transform: false  # 弹性形变（适用于实例分割，但较慢）
+    # 注：不使用任何像素级增强（亮度/对比度/噪声/模糊）
+    # SAR dB 归一化值具有绝对物理意义，像素级扰动会破坏冰山/海水阈值
+
+dataloader:
+  batch_size: 16            # 5090 32GB 可用 16；若显存不足降回 8
+  num_workers: 8            # AutoDL 5090 实例通常有 8~16 CPU core
+  pin_memory: true
+  shuffle_train: true
+  max_patches_per_epoch: 10000  # null = 全量；正整数 = 每 epoch 训练集随机采样该数量（不放回）
+  use_hdf5: True           # true = 优先从 paths.hdf5_dir 读取 .h5 文件（需先运行 pack_hdf5.py）
+
+# ──────────────────────────────────────────
+# 4. 模型参数 (models)
+# ──────────────────────────────────────────
+model:
+  # 选择模型架构: "mask_rcnn" | "unet" | "unet_plus_plus"
+  architecture: "mask_rcnn"
+
+  # ---- Mask R-CNN 专用参数 ----
+  mask_rcnn:
+    backbone: "resnet50"          # 骨干网络: "resnet50" | "resnet101"
+    pretrained_backbone: true     # 是否加载 ImageNet 预训练权重
+    pretrained_weights: null      # 若有完整预训练权重，填写路径
+    num_classes: 2                # 与 dataset.num_classes 保持一致
+    min_size: 512
+    max_size: 512
+    # RPN 参数
+    # Anchor 尺寸设计依据（5 级对应 FPN 的 P2-P6 五个特征层）：
+    #   最小冰山约 10-25 px（min_iceberg_pixels=10），原 32px 最小 anchor
+    #   与 5×5 GT 的 IoU ≈ 0.024，严重偏小。
+    #   改为 8px 起步：IoU(8×8, 5×5) ≈ 0.39，进入 ignored 区间，
+    #   allow_low_quality_matches 仍保证每个 GT 有正样本，训练质量大幅提升。
+    rpn_anchor_sizes: [[8], [16], [32], [64], [128]]
+    rpn_aspect_ratios: [[0.5, 1.0, 2.0]]
+    rpn_nms_thresh: 0.7
+    rpn_fg_iou_thresh: 0.7
+    rpn_bg_iou_thresh: 0.3
+    rpn_batch_size_per_image: 256
+    rpn_positive_fraction: 0.5
+    rpn_pre_nms_top_n_train: 2000
+    rpn_post_nms_top_n_train: 1000
+    rpn_pre_nms_top_n_test: 1000
+    rpn_post_nms_top_n_test: 300
+    # ROI 参数
+    box_score_thresh: 0.05
+    box_nms_thresh: 0.5
+    box_detections_per_img: 300  # 原 100；密集冰山场景超 100 个时旧值会硬截断 recall
+    box_fg_iou_thresh: 0.5
+    box_bg_iou_thresh: 0.5
+    box_batch_size_per_image: 512
+    box_positive_fraction: 0.25
+    # Mask Head
+    mask_roi_pool_output_size: 28  # 原 14；4× 更高掩膜分辨率，对 5-25px 小目标尤为关键
+
+  # ---- U-Net 专用参数（语义分割备选）----
+  unet:
+    encoder: "resnet34"           # timm/segmentation_models 编码器名称
+    pretrained_encoder: true
+    encoder_weights: "imagenet"
+    decoder_channels: [256, 128, 64, 32, 16]
+    in_channels: 1                # 与 dataset.input_channels 一致
+    num_classes: 1                # 二分类输出 1 通道（sigmoid），非 2 通道 softmax
+
+# ──────────────────────────────────────────
+# 5. 训练参数 (train)
+# ──────────────────────────────────────────
+train:
+  epochs: 50
+  start_epoch: 0               # 断点续训时自动更新
+
+  optimizer:
+    type: "adamw"              # "sgd" | "adam" | "adamw"
+    lr: 0.0002
+    weight_decay: 0.0001
+    momentum: 0.9              # 仅 SGD 使用
+    # AdamW betas
+    betas: [0.9, 0.999]
+
+  lr_scheduler:
+    type: "cosine_restart"     # "step" | "cosine" | "cosine_restart" | "plateau"
+    warmup_epochs: 3           # 线性热身轮数
+    warmup_lr_init: 0.00002
+    # CosineAnnealingWarmRestarts 参数（type=cosine_restart 时生效）
+    T_0: 20                    # 第一个周期长度（epoch）
+    T_mult: 2                  # 后续周期倍增系数（周期依次为 20、40、80...）
+    eta_min: 0.000005          # LR 下限（比 warmup_lr_init 更低）
+    # StepLR
+    step_size: 10
+    gamma: 0.5
+    # ReduceLROnPlateau
+    patience: 5
+    factor: 0.5
+
+  # Early Stopping
+  early_stopping:
+    enabled: true
+    patience: 25            # 原 15；cosine_restart 周期末 LR 低迷，需更长窗口避免误触发
+
+  # 梯度裁剪（防止梯度爆炸）
+  grad_clip:
+    enabled: true
+    max_norm: 1.0
+
+  # 混合精度训练（AMP）
+  amp: true
+
+  # 断点保存策略
+  checkpoint:
+    save_best: true            # 是否保存验证集最佳模型
+    save_last: true            # 是否保存最新 epoch 的模型
+    save_every_n_epochs: 5     # 每 N 个 epoch 额外保存一次
+    monitor_metric: "val_mask_iou"  # 监控的验证指标
+    mode: "max"                # "max" 表示越大越好
+
+  # 日志记录
+  logging:
+    use_tensorboard: true
+    use_wandb: false
+    wandb_project: "iceberg-detection"
+    wandb_entity: null         # 你的 wandb 用户名
+    log_every_n_steps: 10      # 每 N 个 step 记录一次损失
+
+  # 设备
+  device: "cuda"               # "cuda" | "cpu"
+  gpu_ids: [0]                 # 使用的 GPU 编号列表（多卡时如 [0,1]）
+
+# ──────────────────────────────────────────
+# 6. 评估与推理参数
+# ──────────────────────────────────────────
+evaluate:
+  batch_size: 2
+  iou_thresholds: [0.5, 0.75]   # mAP 计算的 IoU 阈值列表
+  score_threshold: 0.3          # 原 0.5；降低阈值提升 recall（precision 略降可接受）
+
+inference:
+  checkpoint_path: "outputs/checkpoints/best_model.pth"
+  score_threshold: 0.3          # 原 0.5；与 evaluate 保持一致
+  nms_iou_threshold: 0.5        # NMS IoU 阈值
+  # 大图滑窗推理参数
+  sliding_window:
+    enabled: true
+    window_size: 512
+    stride: 448                 # 步长 = window_size - overlap
+  output_format: "gpkg"         # 输出格式: "gpkg" | "shp" | "geojson"
+  save_visualization: true      # 是否保存可视化结果图

@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(pip show:*)",
+      "Bash(where python:*)",
+      "Bash(conda info:*)",
+      "Bash(conda run:*)",
+      "Bash(F:\\\\Anaconda\\\\Software\\\\envs\\\\pytorch\\\\python.exe:*)",
+      "Bash(F:/Software/Miniconda/envs/si-stsar/python.exe:*)",
+      "Bash(\"F:/Software/Miniconda/envs/si-stsar/python.exe\" -c \"import torch; print\\('torch:', torch.__version__\\); import torchvision; print\\('tv:', torchvision.__version__\\)\")",
+      "Bash(\"F:/Software/Miniconda/envs/si-stsar/python.exe\" -m pip install opencv-python albumentations rasterio geopandas omegaconf tqdm colorlog -q)",
+      "Bash(\"F:/Software/Miniconda/envs/si-stsar/python.exe\" -c \"import torch,torchvision; from torchvision.models.detection import maskrcnn_resnet50_fpn; print\\('torchvision:', torchvision.__version__\\); from torch.optim.lr_scheduler import LinearLR, SequentialLR, CosineAnnealingLR; print\\('schedulers OK'\\)\")",
+      "Bash(\"F:/Software/Miniconda/envs/si-stsar/python.exe\" -m pip install matplotlib -q)",
+      "Bash(F:/Software/Miniconda/envs/ice-binary/python.exe *)",
+      "Bash(Select-String \"torch\")",
+      "Bash(conda env *)",
+      "Bash(F:/Anaconda/Software/envs/pytorch/python.exe *)",
+      "Bash(Get-ChildItem -Path \"F:\\\\ZJU\\\\11_Ice\\\\code\" -Directory)",
+      "Bash(Select-Object Name)",
+      "Bash(powershell *)",
+      "WebSearch"
+    ]
+  }
+}

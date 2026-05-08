@@ -1,0 +1,70 @@
+// Part 1: Generate 5-degree grid (unchanged)
+var lon = new Array(73);
+for (var i = 0; i < lon.length; i++) {
+  lon[i] = -180 + 5 * i;
+}
+var lat = new Array(6);
+for (var i = 0; i < lat.length; i++) {
+  lat[i] = -80 + 5 * i;
+}
+var roi_s = new Array(lon.length * lat.length);
+for (var i = 0; i < lon.length - 1; i++) {
+  for (var j = 0; j < lat.length - 1; j++) {
+    var lup = [lon[i],   lat[j + 1]];
+    var lbt = [lon[i],   lat[j]];
+    var rup = [lon[i + 1], lat[j]];
+    var rbt = [lon[i + 1], lat[j + 1]];
+    roi_s[i * lat.length + j] = ee.Feature(
+      ee.Geometry.Polygon({
+        coords: [lup, lbt, rup, rbt],
+        proj: 'EPSG:4326',
+        geodesic: false,
+        maxError: 1000
+      })
+    );
+  }
+}
+var roi_fc = ee.FeatureCollection(roi_s);
+Map.addLayer(roi_fc, {}, '5 Degree Grid');
+
+// Part 2: Load Sentinel-1 GRD dataset (filter conditions unchanged)
+var imageCollection = ee.ImageCollection('COPERNICUS/S1_GRD');
+
+for (var i = 0; i <100; i++) {
+  if (roi_s[i] && roi_s[i].geometry()) {
+    var roi = ee.Feature(roi_s[i]).geometry();
+
+    // 1. Filter and sort by time in ascending order (from beginning to end of the month)
+    var imgs = imageCollection
+      .filterBounds(roi)
+      .filterDate('2021-10-01', '2021-10-31')
+      .filter(ee.Filter.eq('instrumentMode', 'EW'))
+      .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'HH'))
+      .sort('system:time_start', true);
+
+    // 2. Print earliest (beginning of month) image time
+    var firstDate = ee.Date(imgs.first().get('system:time_start'));
+    print('Grid', i + 1, 'earliest image time:', firstDate.format('YYYY-MM-dd HH:mm:ss'));
+
+    // 3. Mosaic: later (end of month) images overwrite earlier images
+    var mo = imgs.select('HH').mosaic();
+
+    // 4. Clip & export
+    var clip = mo.clip(roi);
+    Export.image.toDrive({
+      image:       clip,
+      description: 'grid_' + (i+1) + '_hh_2024_10',
+      folder:      'HH_202410_Mosaic',
+      scale:       40,
+      region:      roi,
+      crs:         'EPSG:4326',
+      maxPixels:   1e13
+    });
+
+    // 5. Visualization
+    Map.addLayer(mo,   {min: -25, max: 0}, 'Mosaic HH ' + (i+1));
+    Map.addLayer(clip, {min: -25, max: 0}, 'Clipped HH ' + (i+1));
+  } else {
+    print('Grid', i+1, 'invalid, skipped');
+  }
+}

@@ -1,0 +1,26 @@
+# Directories
+data/
+"Iceberg detection code/"
+"Iceberg sample set/"
+outputs/
+Obsidian/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# VSCode specific
+.vscode/
+
+# Temporary files
+temp.txt
+
+# Other file types
+*.pdf
+*.nc
+*.gpkg
+*.xlsx
+.DS_Store

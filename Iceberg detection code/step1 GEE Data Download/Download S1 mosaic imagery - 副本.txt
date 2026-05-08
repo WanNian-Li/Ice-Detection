@@ -1,0 +1,84 @@
+// Part 1: Generate 5-degree grid
+var lon = new Array(73);
+for (var i = 0; i < lon.length; i++) {
+  lon[i] = -180 + 5 * i;
+}
+var lat = new Array(6);
+for (var i = 0; i < lat.length; i++) {
+  lat[i] = -80 + 5 * i;
+}
+
+var roi_s = new Array((lon.length - 1) * (lat.length - 1));
+var index = 0;
+for (var i = 0; i < lon.length - 1; i++) {
+  for (var j = 0; j < lat.length - 1; j++) {
+    var lup = [lon[i],   lat[j + 1]];
+    var lbt = [lon[i],   lat[j]];
+    var rup = [lon[i + 1], lat[j]];
+    var rbt = [lon[i + 1], lat[j + 1]];
+    roi_s[index] = ee.Feature(
+      ee.Geometry.Polygon({
+        coords: [lup, lbt, rup, rbt],
+        proj: 'EPSG:4326',
+        geodesic: false,
+        maxError: 1000
+      })
+    );
+    index++;
+  }
+}
+var roi_fc = ee.FeatureCollection(roi_s);
+Map.addLayer(roi_fc, {}, '5 Degree Grid');
+
+// Part 2: Load Sentinel-1 GRD dataset
+var imageCollection = ee.ImageCollection('COPERNICUS/S1_GRD');
+
+// 【关键修改点】：原作者的代码限制了 i < 100 [cite: 1043]，但南极其实有 360 个网格。
+// 建议：每次下载 50 个网格（比如 0~50, 50~100），防止你的 Google Drive 塞满或浏览器卡死。
+// 这里我们先跑前 10 个网格做个测试。
+var start_grid = 0;
+var end_grid = 10; 
+
+for (var i = start_grid; i < end_grid; i++) {
+  if (roi_s[i] && roi_s[i].geometry()) {
+    var roi = ee.Feature(roi_s[i]).geometry();
+    
+    // 1. 过滤：我这里帮你把时间改成了 2018 年 10 月，对齐你的标签
+    var imgs = imageCollection
+      .filterBounds(roi)
+      .filterDate('2018-10-01', '2018-10-31') // 同步修改了这里的年份
+      .filter(ee.Filter.eq('instrumentMode', 'EW'))
+      .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'HH'))
+      .sort('system:time_start', true);
+      
+    // 防止某些网格在那个月刚好没有卫星经过导致报错
+    if (imgs.size().getInfo() === 0) {
+      print('Grid ' + (i+1) + ' 没有图像，跳过');
+      continue;
+    }
+
+    var firstDate = ee.Date(imgs.first().get('system:time_start'));
+    print('Grid ' + (i + 1) + ' earliest image time:', firstDate.format('YYYY-MM-dd HH:mm:ss'));
+
+    // 3. 镶嵌图像 [cite: 1046]
+    var mo = imgs.select('HH').mosaic();
+    
+    // 4. 裁剪并准备导出 [cite: 1047]
+    var clip = mo.clip(roi);
+    
+    // 同步修改了导出名称，防止像原作者那样年份对不上 [cite: 1048]
+    Export.image.toDrive({
+      image:       clip,
+      description: 'grid_' + (i+1) + '_hh_2018_10', 
+      folder:      'HH_201810_Mosaic', 
+      scale:       40,
+      region:      roi,
+      crs:         'EPSG:4326',
+      maxPixels:   1e13
+    });
+    
+  } else {
+    print('Grid', i+1, 'invalid, skipped');
+  }
+}
+// 删除了原文件末尾多余的右括号 [cite: 1051]
