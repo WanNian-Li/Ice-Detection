@@ -333,6 +333,49 @@ class IcebergHDF5Dataset(IcebergDataset):
             self._h5 = h5py.File(str(self.h5_path), "r")
         return self._h5
 
+    def _copy_paste(
+        self, f: h5py.File, dst_img: np.ndarray, dst_mask: np.ndarray
+    ) -> tuple:
+        """
+        Copy-Paste 实例增强（Strategy A）。
+
+        从随机样本（src）中抠取冰山实例，直接覆盖粘贴到当前样本（dst）的对应像素位置。
+        SAR 图像中冰山亮度值具有绝对物理意义，不依赖上下文，直接像素替换语义合理。
+
+        新实例分配不与 dst 冲突的 ID（dst_max_id + 1, +2, ...），
+        _build_maskrcnn_target 按 ID 提取实例，无需额外处理。
+        """
+        aug_cfg = self.cfg.dataset.augmentation
+        p = float(aug_cfg.get("copy_paste_prob", 0.0))
+        if p <= 0.0 or np.random.random() > p:
+            return dst_img, dst_mask
+
+        src_idx  = np.random.randint(0, self._len)
+        src_img  = f["images"][src_idx]
+        src_mask = f["masks"][src_idx].astype(np.int32)
+
+        src_ids = np.unique(src_mask)
+        src_ids = src_ids[src_ids > 0]
+        if len(src_ids) == 0:
+            return dst_img, dst_mask
+
+        # 随机选 1–3 个实例粘贴，避免过度覆盖原图内容
+        n_paste  = np.random.randint(1, min(len(src_ids), 3) + 1)
+        paste_ids = np.random.choice(src_ids, size=n_paste, replace=False)
+
+        dst_max_id = int(dst_mask.max())
+        new_img    = dst_img.copy()
+        new_mask   = dst_mask.copy()
+
+        for i, iid in enumerate(paste_ids):
+            inst = (src_mask == iid)
+            if inst.sum() < 4:
+                continue
+            new_img[inst]  = src_img[inst]
+            new_mask[inst] = dst_max_id + i + 1
+
+        return new_img, new_mask
+
     def __getitem__(self, idx: int):
         f = self._get_h5()
         image = f["images"][idx]              # (H, W)，float32，[0, 1]
@@ -340,6 +383,10 @@ class IcebergHDF5Dataset(IcebergDataset):
 
         # ── 在线 SAR 斑点降噪 ──
         image = self._despeckle(image)
+
+        # ── Copy-Paste 增强（Strategy A，仅训练集，仅实例分割架构）──
+        if self.split == "train" and self.architecture in ("mask_rcnn", "mask2former"):
+            image, mask = self._copy_paste(f, image, mask)
 
         if self.architecture in ("mask_rcnn", "mask2former", "yolo"):
             image_hwc = np.stack([image] * 3, axis=-1)   # (H, W, 3)

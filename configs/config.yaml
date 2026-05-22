@@ -137,6 +137,10 @@ dataset:
     # 注：不使用任何像素级增强（亮度/对比度/噪声/模糊）
     # SAR dB 归一化值具有绝对物理意义，像素级扰动会破坏冰山/海水阈值
 
+    # Copy-Paste 实例增强（Strategy A）
+    # 从随机样本抠取冰山实例粘贴到当前样本；仅对 mask_rcnn/mask2former 生效
+    copy_paste_prob: 0.5     # 触发概率；0.0 = 关闭
+
 dataloader:
   batch_size: 4            # 离线预处理后无 CPU 瓶颈，5090 32GB 可安全开到 32
   num_workers: 4           # HDF5 读取极快，12 个 worker 足够维持 GPU 满载；可继续上调至 16
@@ -156,7 +160,14 @@ model:
 
   # ---- Mask R-CNN 专用参数 ----
   mask_rcnn:
-    backbone: "resnet50"          # 骨干网络: "resnet50" | "resnet101"
+    # 骨干网络选择（Strategy B）：
+    #   "resnet50"                              torchvision 内置，ImageNet-1k 预训练（默认）
+    #   "convnext_small.fb_in22k_ft_in1k"       ConvNeXt-S，ImageNet-22k 预训练，泛化更强（推荐）
+    #   "convnext_base.fb_in22k_ft_in1k"        ConvNeXt-B，精度更高，显存约多 30%
+    #   "swin_tiny_patch4_window7_224.ms_in22k_ft_in1k"   Swin-T，注意力骨干，适合纹理分析
+    #   "swin_small_patch4_window7_224.ms_in22k_ft_in1k"  Swin-S，精度/速度均衡
+    # 非 resnet50 选项需要 `pip install timm`，首次运行自动下载预训练权重
+    backbone: "resnet50"
     pretrained_backbone: true     # 是否加载 ImageNet 预训练权重
     pretrained_weights: null      # 若有完整预训练权重，填写路径
     num_classes: 2                # 与 dataset.num_classes 保持一致
