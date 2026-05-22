@@ -18,7 +18,6 @@ data_prep/prepare_dataset.py
 """
 
 import argparse
-import json
 import logging
 import os
 import re
@@ -43,6 +42,7 @@ from tqdm import tqdm
 # 将项目根目录加入路径，以便在任意位置运行此脚本
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from configs.config_parser import get_config
+from utils.despeckle import rtv_smooth_db
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -171,6 +171,14 @@ def normalize_sar(
 
 
 # ──────────────────────────────────────────────────────────────────
+# 自定义异常
+# ──────────────────────────────────────────────────────────────────
+
+class DriveDisconnectedError(RuntimeError):
+    """Google Drive FUSE 挂载断开时抛出，用于区分普通文件缺失错误。"""
+
+
+# ──────────────────────────────────────────────────────────────────
 # 主类：IcebergPreparer
 # ──────────────────────────────────────────────────────────────────
 
@@ -199,8 +207,11 @@ class IcebergPreparer:
         # 断点续跑：优先使用 CLI 显式参数，其次读取配置文件。
         cfg_resume = bool(self.dp.get("resume_enabled", False))
         self.resume_enabled = cfg_resume if resume_enabled is None else bool(resume_enabled)
-        self.resume_verify_files = bool(self.dp.get("resume_verify_files", True))
-        self.scene_done_dir = Path(self.paths.split_dir) / "scene_done"
+
+        # 已完成场景记录文件（每行一个场景名）
+        self._done_scenes_file = Path(self.paths.split_dir) / "completed_scenes.txt"
+        self._done_scenes: set = set()
+
         self.patch_img_dir = Path(self.paths.patch_image_dir)
         self.patch_msk_dir = Path(self.paths.patch_mask_dir)
         self._existing_patch_index: Dict[str, List[Dict]] = {}
@@ -210,6 +221,22 @@ class IcebergPreparer:
             int(self.dp.target_crs.split(":")[1])
         )
 
+        # 离线 RTV 平滑配置
+        tv_cfg = self.dp.get("tv_smooth", {})
+        self.tv_enabled = bool(
+            tv_cfg.get("enabled", False) if isinstance(tv_cfg, dict) else tv_cfg.enabled
+        )
+        if self.tv_enabled:
+            self.tv_weight    = float(tv_cfg.get("weight",    0.01))
+            self.tv_sigma     = float(tv_cfg.get("sigma",     3.0))
+            self.tv_sharpness = float(tv_cfg.get("sharpness", 0.005))
+            self.tv_max_iter  = int(tv_cfg.get("max_iter",    4))
+            logger.info(
+                f"离线 RTV 平滑已启用: lambda={self.tv_weight}, "
+                f"sigma={self.tv_sigma}, sharpness={self.tv_sharpness}, "
+                f"iter={self.tv_max_iter}"
+            )
+
         # 计数器（用于最终统计报告）
         self.stats = {
             "total_scenes": 0,
@@ -218,6 +245,7 @@ class IcebergPreparer:
             "kept_patches": 0,
             "dropped_nan": 0,
             "dropped_no_iceberg": 0,
+            "bg_patches_sampled": 0,
         }
 
     # ────────────────────────────────────────
@@ -229,15 +257,13 @@ class IcebergPreparer:
         logger.info("=" * 60)
 
         if self.resume_enabled and not self.dry_run:
-            self.scene_done_dir.mkdir(parents=True, exist_ok=True)
+            self._done_scenes = self._load_done_scenes()
             logger.info(
-                f"场景级断点续跑已启用（verify_files={self.resume_verify_files}）"
+                f"场景级断点续跑已启用，已完成场景: {len(self._done_scenes)} 个"
+                f"（记录文件: {self._done_scenes_file}）"
             )
-            self._existing_patch_index = self._index_existing_scene_patches()
-            if self._existing_patch_index:
-                logger.info(
-                    f"检测到 {len(self._existing_patch_index)} 个场景已存在 patch 文件，可直接跳过"
-                )
+            if self._done_scenes:
+                self._existing_patch_index = self._index_existing_scene_patches()
 
         existing_records_by_scene = self._load_existing_records_by_scene()
         logger.info("冰山数据集预处理开始")
@@ -258,42 +284,47 @@ class IcebergPreparer:
         for sar_path in sar_files:
             scene_name = sar_path.stem
 
-            if self._should_resume_skip_scene(scene_name):
+            # 断点续跑：场景名在记录文件中则直接跳过，不做任何其他检测
+            if self.resume_enabled and scene_name in self._done_scenes:
+                self.stats["skipped_scenes_resume"] += 1
+                self.stats["total_scenes"] += 1
+                resumed_scene_names.add(scene_name)
+
                 cached = existing_records_by_scene.get(scene_name)
                 if cached:
-                    self.stats["skipped_scenes_resume"] += 1
-                    self.stats["total_scenes"] += 1        # 计入统计（已处理场景）
                     self.stats["kept_patches"] += len(cached)
-                    resumed_scene_names.add(scene_name)
                     all_patch_records.extend(cached)
                     logger.info(
                         f"跳过已完成场景: {scene_name}（复用历史元数据 {len(cached)} 条）"
                     )
-                    continue
+                else:
+                    rebuilt = self._build_records_from_existing_patches(scene_name)
+                    if rebuilt:
+                        self.stats["kept_patches"] += len(rebuilt)
+                        all_patch_records.extend(rebuilt)
+                        logger.info(
+                            f"跳过已完成场景: {scene_name}（重建元数据 {len(rebuilt)} 条）"
+                        )
+                    else:
+                        logger.info(f"跳过已完成场景: {scene_name}（无有效切片）")
+                continue
 
-                rebuilt = self._build_records_from_existing_patches(scene_name)
-                if rebuilt:
-                    self.stats["skipped_scenes_resume"] += 1
-                    self.stats["total_scenes"] += 1
-                    self.stats["kept_patches"] += len(rebuilt)
-                    resumed_scene_names.add(scene_name)
-                    all_patch_records.extend(rebuilt)
-                    logger.info(
-                        f"跳过已存在 patch 场景: {scene_name}（重建元数据 {len(rebuilt)} 条）"
-                    )
-                    continue
-
-                logger.warning(
-                    f"场景 {scene_name} 命中 resume 条件，但无法重建已有 patch 元数据，"
-                    "将重新处理。"
+            try:
+                records = self._process_scene(sar_path)
+            except DriveDisconnectedError as e:
+                logger.error(f"\n[!] Drive 挂载断开，预处理中断于场景: {scene_name}")
+                logger.error(f"    {e}")
+                logger.error(
+                    "    处理方法：\n"
+                    "    1. 在 Colab 重新运行 drive.mount('/content/drive', force_remount=True)\n"
+                    "    2. 重新运行本脚本（已完成场景会自动跳过）"
                 )
-
-            records = self._process_scene(sar_path)
+                break
             # 如果 _process_scene 返回 None，说明是因无法匹配文件等硬性错误跳过的，此时不标记
             if records is not None:
                 all_patch_records.extend(records)
                 # 无论 records 是否为空（即无论是否生成切片），都进行标记
-                self._mark_scene_done(scene_name, len(records))
+                self._mark_scene_done(scene_name)
 
         logger.info(f"\n处理完成：共生成 {len(all_patch_records)} 个有效切片")
 
@@ -331,9 +362,16 @@ class IcebergPreparer:
             grouped[str(scene)] = sub.to_dict(orient="records")
         return grouped
 
-    def _scene_done_file(self, scene_name: str) -> Path:
-        """返回场景完成标记文件路径。"""
-        return self.scene_done_dir / f"{scene_name}.done.json"
+    def _load_done_scenes(self) -> set:
+        """从 completed_scenes.txt 加载已完成的场景名集合。"""
+        if not self._done_scenes_file.exists():
+            return set()
+        try:
+            text = self._done_scenes_file.read_text(encoding="utf-8")
+            return {line.strip() for line in text.splitlines() if line.strip()}
+        except Exception as exc:
+            logger.warning(f"读取断点续跑记录失败，将从头处理所有场景: {exc}")
+            return set()
 
     def _index_existing_scene_patches(self) -> Dict[str, List[Dict]]:
         """
@@ -343,9 +381,8 @@ class IcebergPreparer:
         if not self.patch_img_dir.exists():
             return {}
 
-        # verify_files=True 时要求图像/掩膜成对存在；否则仅检查图像 patch。
         mask_names = set()
-        if self.resume_verify_files and self.patch_msk_dir.exists():
+        if self.patch_msk_dir.exists():
             mask_names = {p.name for p in self.patch_msk_dir.glob("*.npy")}
 
         pattern = re.compile(r"^(?P<scene>.+)_r(?P<row>\d+)_c(?P<col>\d+)\.npy$")
@@ -355,7 +392,7 @@ class IcebergPreparer:
             m = pattern.match(img_path.name)
             if not m:
                 continue
-            if self.resume_verify_files and img_path.name not in mask_names:
+            if img_path.name not in mask_names:
                 continue
 
             scene_name = m.group("scene")
@@ -396,58 +433,14 @@ class IcebergPreparer:
             )
         return records
 
-    def _should_resume_skip_scene(self, scene_name: str) -> bool:
-        """
-        判断当前场景是否可在 resume 模式下跳过。
-        """
-        if not self.resume_enabled or self.dry_run:
-            return False
-
-        # 最高优先级：只要目标路径已存在该场景 patch，即视为可跳过。
-        if self._existing_patch_index.get(scene_name):
-            return True
-
-        done_file = self._scene_done_file(scene_name)
-        if not done_file.exists():
-            return False
-
-        expected = None
-        try:
-            payload = json.loads(done_file.read_text(encoding="utf-8"))
-            expected = int(payload.get("kept_patches", 0))
-        except Exception:
-            logger.warning(f"完成标记损坏，将重新处理场景: {scene_name}")
-            return False
-
-        if not self.resume_verify_files:
-            return expected > 0
-
-        img_count = len(list(self.patch_img_dir.glob(f"{scene_name}_r*_c*.npy")))
-        msk_count = len(list(self.patch_msk_dir.glob(f"{scene_name}_r*_c*.npy")))
-        if img_count == expected and msk_count == expected and expected > 0:
-            return True
-
-        logger.warning(
-            f"场景 {scene_name} 标记与文件数不一致，重新处理。"
-            f" expected={expected}, images={img_count}, masks={msk_count}"
-        )
-        return False
-
-    def _mark_scene_done(self, scene_name: str, kept_patches: int):
-        """在场景成功处理后写入完成标记。"""
+    def _mark_scene_done(self, scene_name: str):
+        """将场景名追加到 completed_scenes.txt，标记为已完成。"""
         if not self.resume_enabled or self.dry_run:
             return
-        # kept_patches 可以为 0
-
-        done_file = self._scene_done_file(scene_name)
-        payload = {
-            "scene": scene_name,
-            "kept_patches": int(kept_patches),
-        }
-        done_file.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        self._done_scenes_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._done_scenes_file, "a", encoding="utf-8") as f:
+            f.write(scene_name + "\n")
+        self._done_scenes.add(scene_name)
 
     # ────────────────────────────────────────
     # Step 1：扫描 SAR 文件
@@ -485,12 +478,21 @@ class IcebergPreparer:
         vec_dir = Path(self.paths.raw_vector_dir)
         # 精确匹配
         exact = vec_dir / f"{year_month}_distribution.gpkg"
-        if exact.exists():
-            return exact
-        # 模糊匹配：文件名中包含年月
-        for f in vec_dir.glob("*.gpkg"):
-            if year_month in f.stem:
-                return f
+        try:
+            if exact.exists():
+                return exact
+            # 模糊匹配：文件名中包含年月
+            for f in vec_dir.glob("*.gpkg"):
+                if year_month in f.stem:
+                    return f
+        except OSError as e:
+            import errno as _errno
+            if e.errno == _errno.ENOTCONN:  # 107: Transport endpoint is not connected
+                raise DriveDisconnectedError(
+                    "Google Drive 挂载断开 (errno=107)。"
+                    "请在 Colab 重新运行挂载单元格后，再次执行脚本（断点续跑会自动跳过已完成场景）。"
+                ) from e
+            raise
         return None
 
     # ────────────────────────────────────────
@@ -755,8 +757,11 @@ class IcebergPreparer:
         img_out_dir.mkdir(parents=True, exist_ok=True)
         msk_out_dir.mkdir(parents=True, exist_ok=True)
 
+        bg_ratio = float(self.dp.get("background_patch_ratio", 0.0))
+
         records = []
         patch_id = 0
+        bg_candidate_positions: List[Tuple[int, int]] = []  # (row, col) of valid bg patches
 
         # 滑窗遍历：行优先
         row_starts = list(range(0, H - patch_size + 1, stride))
@@ -791,10 +796,23 @@ class IcebergPreparer:
                     self.stats["dropped_nan"] += 1
                     continue
                 if drop_reason == "no_iceberg":
-                    self.stats["dropped_no_iceberg"] += 1
+                    # 暂存位置，待前景统计完成后按比例随机采样
+                    if bg_ratio > 0:
+                        bg_candidate_positions.append((row, col))
                     continue
 
                 self.stats["kept_patches"] += 1
+
+                # ---- 离线 RTV 平滑（在归一化之前，在 dB 域操作）----
+                # 对应论文 MATLAB: db2mag → tsmooth → (存储) → 归一化
+                if self.tv_enabled:
+                    img_patch = rtv_smooth_db(
+                        img_patch,
+                        weight=self.tv_weight,
+                        sigma=self.tv_sigma,
+                        sharpness=self.tv_sharpness,
+                        max_iter=self.tv_max_iter,
+                    )
 
                 # ---- 归一化 ----
                 norm_patch = normalize_sar(
@@ -822,12 +840,61 @@ class IcebergPreparer:
                     "col_offset": col,
                     "image_path": str(img_save_path),
                     "mask_path":  str(msk_save_path),
-                    "iceberg_pixels": int((msk_patch > 0).sum()),  # 前景像素数
+                    "iceberg_pixels": int((msk_patch > 0).sum()),
                     "nan_ratio":  float(np.isnan(img_patch).mean()),
                 })
                 patch_id += 1
 
         pbar.close()
+
+        # ---- 背景切片采样 ----
+        n_bg_candidates = len(bg_candidate_positions)
+        n_fg = len(records)
+        n_bg_target = min(round(n_fg * bg_ratio), n_bg_candidates)
+
+        if n_bg_target > 0:
+            rng = np.random.default_rng(int(self.dp.random_seed))
+            chosen_idx = rng.choice(n_bg_candidates, size=n_bg_target, replace=False)
+
+            for idx in sorted(chosen_idx.tolist()):
+                row, col = bg_candidate_positions[idx]
+                img_patch = image[row: row + patch_size, col: col + patch_size]
+                msk_patch = mask[row: row + patch_size, col: col + patch_size]  # 全零掩膜
+
+                norm_patch = normalize_sar(
+                    img_patch,
+                    method=self.dp.normalize.method,
+                    db_min=float(self.dp.normalize.db_clip_min),
+                    db_max=float(self.dp.normalize.db_clip_max),
+                    p_low=float(self.dp.normalize.percentile_low),
+                    p_high=float(self.dp.normalize.percentile_high),
+                )
+
+                fname = f"{scene_name}_r{row:05d}_c{col:05d}"
+                img_save_path = img_out_dir / f"{fname}.npy"
+                msk_save_path = msk_out_dir / f"{fname}.npy"
+
+                if not self.dry_run:
+                    np.save(img_save_path, norm_patch)
+                    np.save(msk_save_path, msk_patch)
+
+                records.append({
+                    "scene":      scene_name,
+                    "patch_id":   patch_id,
+                    "row_offset": row,
+                    "col_offset": col,
+                    "image_path": str(img_save_path),
+                    "mask_path":  str(msk_save_path),
+                    "iceberg_pixels": 0,
+                    "nan_ratio":  float(np.isnan(img_patch).mean()),
+                })
+                patch_id += 1
+
+        n_bg_sampled = n_bg_target
+        self.stats["dropped_no_iceberg"] += n_bg_candidates - n_bg_sampled
+        self.stats["bg_patches_sampled"] += n_bg_sampled
+        self.stats["kept_patches"] += n_bg_sampled
+
         return records
 
     def _get_drop_reason(
@@ -956,7 +1023,10 @@ class IcebergPreparer:
         logger.info(f"  切片总数:          {s['total_patches']}")
         logger.info(f"  丢弃（NaN过多）:    {s['dropped_nan']}")
         logger.info(f"  丢弃（无冰山）:     {s['dropped_no_iceberg']}")
-        logger.info(f"  最终保留:          {s['kept_patches']}")
+        logger.info(f"  背景切片采样:      {s['bg_patches_sampled']}")
+        logger.info(f"  最终保留:          {s['kept_patches']}"
+                    f"（前景 {s['kept_patches'] - s['bg_patches_sampled']} + "
+                    f"背景 {s['bg_patches_sampled']}）")
         if s["total_patches"] > 0:
             keep_rate = s["kept_patches"] / s["total_patches"] * 100
             logger.info(f"  保留率:            {keep_rate:.1f}%")

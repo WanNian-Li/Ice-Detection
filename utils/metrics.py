@@ -6,11 +6,14 @@ utils/metrics.py
 ── 语义分割（U-Net）──
     compute_semantic_iou(preds, targets, num_classes)  →  dict
 
-── 实例分割（Mask R-CNN）──
-    compute_instance_metrics(predictions, targets, iou_thresh)  →  dict
+── 实例分割（Mask R-CNN / YOLO）──
+    InstanceMetricsAccumulator          流式累加器（逐图推入，只保留标量）
+    compute_instance_metrics(...)  →  dict  批量接口（内部用累加器实现）
 
-两个函数均返回形如 {"val_mask_iou": float, ...} 的字典，
-与 config.yaml 中的 monitor_metric 键名对应。
+    主要指标：val_ap50（AP@IoU=0.5）
+      - 对所有置信度阈值积分，不依赖固定阈值，是实例分割的标准 COCO 指标
+    辅助指标：val_precision / val_recall / val_f1
+      - 在固定 score_thresh 下计算，仅供参考，不用于模型保存决策
 """
 
 from typing import Dict, List
@@ -24,63 +27,21 @@ import torch
 # ──────────────────────────────────────────────────────────────────
 
 def mask_iou(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
-    """
-    计算两个二值掩膜之间的 IoU（Intersection over Union）。
-
-    Args:
-        pred_bin: (H, W) bool/uint8，预测掩膜
-        gt_bin:   (H, W) bool/uint8，真值掩膜
-
-    Returns:
-        IoU ∈ [0, 1]；两者均为空时返回 1.0
-    """
+    """计算两个二值掩膜之间的 IoU。两者均为空时返回 1.0。"""
     inter = np.logical_and(pred_bin, gt_bin).sum()
     union = np.logical_or(pred_bin, gt_bin).sum()
     if union == 0:
-        return 1.0   # 预测和 GT 都是空 → 完全匹配
+        return 1.0
     return float(inter) / float(union)
 
 
-def _greedy_match(
-    pred_masks: np.ndarray,   # (N_pred, H, W) bool
-    gt_masks:   np.ndarray,   # (N_gt,   H, W) bool
-    iou_thresh: float,
-) -> List[float]:
-    """
-    贪心匹配：对每个 GT 实例找 IoU 最高的预测，若 IoU >= 阈值则算命中。
-
-    Returns:
-        matched_ious: 每个命中的 (pred, gt) 对的 IoU 列表
-    """
-    if len(pred_masks) == 0 or len(gt_masks) == 0:
-        return []
-
-    # 构建 IoU 矩阵 (N_pred, N_gt)
-    iou_matrix = np.zeros((len(pred_masks), len(gt_masks)), dtype=np.float32)
-    for i, pm in enumerate(pred_masks):
-        for j, gm in enumerate(gt_masks):
-            iou_matrix[i, j] = mask_iou(pm, gm)
-
-    matched_ious = []
-    used_pred = set()
-    used_gt   = set()
-
-    # 按 IoU 从高到低依次匹配
-    flat_indices = np.dstack(np.unravel_index(
-        np.argsort(-iou_matrix.ravel()), iou_matrix.shape
-    ))[0]
-
-    for pi, gi in flat_indices:
-        if pi in used_pred or gi in used_gt:
-            continue
-        iou = iou_matrix[pi, gi]
-        if iou < iou_thresh:
-            break
-        matched_ious.append(iou)
-        used_pred.add(pi)
-        used_gt.add(gi)
-
-    return matched_ious
+def _compute_ap_101(recalls: np.ndarray, precisions: np.ndarray) -> float:
+    """COCO 101-point 插值 AP。recalls/precisions 已包含 (0, 1.0) 边界点。"""
+    ap = 0.0
+    for t in np.linspace(0, 1, 101):
+        mask = recalls >= t
+        ap += float(precisions[mask].max()) if mask.any() else 0.0
+    return ap / 101.0
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -101,28 +62,21 @@ def compute_semantic_iou(
         num_classes: 类别总数
 
     Returns:
-        dict:
-          "val_mask_iou"    : 前景类（冰山）IoU
-          "val_miou"        : 所有类别的平均 IoU（背景 + 冰山）
-          "val_dice"        : 前景类 Dice 系数
+        dict: val_mask_iou / val_miou / val_dice
     """
-    preds   = preds.cpu().numpy().astype(bool)    # (B, H, W)
-    targets = targets.cpu().numpy().astype(bool)  # (B, H, W)
+    preds   = preds.cpu().numpy().astype(bool)
+    targets = targets.cpu().numpy().astype(bool)
 
     per_class_iou = []
     for c in range(num_classes):
-        pred_c = (preds   == c) if c > 0 else (~preds)     # 类别 c 的二值图
+        pred_c = (preds   == c) if c > 0 else (~preds)
         gt_c   = (targets == c) if c > 0 else (~targets)
+        inter  = (pred_c & gt_c).sum()
+        union  = (pred_c | gt_c).sum()
+        per_class_iou.append(float(inter) / float(union + 1e-8))
 
-        inter = (pred_c & gt_c).sum()
-        union = (pred_c | gt_c).sum()
-        iou   = float(inter) / float(union + 1e-8)
-        per_class_iou.append(iou)
-
-    # 前景类（冰山，class=1）的 IoU
     fg_iou = per_class_iou[1] if num_classes > 1 else per_class_iou[0]
 
-    # Dice = 2 * |P∩G| / (|P| + |G|)
     pred_fg = preds.astype(np.uint8)
     gt_fg   = targets.astype(np.uint8)
     inter_d = (pred_fg & gt_fg).sum()
@@ -136,91 +90,171 @@ def compute_semantic_iou(
 
 
 # ──────────────────────────────────────────────────────────────────
-# Mask R-CNN 实例分割指标
+# 实例分割指标：流式累加器
 # ──────────────────────────────────────────────────────────────────
 
-def compute_instance_metrics(
-    predictions: List[Dict[str, torch.Tensor]],
-    targets:     List[Dict[str, torch.Tensor]],
-    iou_thresh:  float = 0.5,
-    score_thresh: float = 0.5,
-) -> Dict[str, float]:
+class InstanceMetricsAccumulator:
     """
-    计算 Mask R-CNN 的实例级指标（用于验证集监控）。
+    流式实例分割指标累加器。
 
-    Args:
-        predictions: 模型 eval 模式输出的 List[Dict]，每个 dict 含：
-                       - 'masks':  (N, 1, H, W) float32，概率图
-                       - 'scores': (N,) float32
-                       - 'labels': (N,) int64
-        targets:     DataLoader 提供的 List[Dict]，每个 dict 含：
-                       - 'masks':  (M, H, W) bool
-                       - 'labels': (M,) int64
-        iou_thresh:  匹配时使用的 IoU 阈值
-        score_thresh: 预测置信度阈值（低于此值的预测被过滤）
+    用法：
+        acc = InstanceMetricsAccumulator(iou_thresh=0.5, score_thresh=0.3)
+        for pred, gt in zip(predictions, targets):
+            acc.update(pred, gt)      # 逐图推入，掩膜即时释放
+        metrics = acc.compute()
 
-    Returns:
-        dict:
-          "val_mask_iou" : 匹配实例的平均 Mask IoU（主要监控指标）
-          "val_precision": 精确率 @ iou_thresh
-          "val_recall"   : 召回率 @ iou_thresh
-          "val_f1"       : F1 分数
+    内存开销：O(N_pred_total) 个标量，而非 O(N_pred × H × W) 个掩膜像素。
+    对于 1000 张验证图、每张 20 个预测，仅需 ~160 KB（vs. 几十 GB 掩膜）。
     """
-    all_ious  = []
-    total_tp  = 0
-    total_fp  = 0
-    total_fn  = 0
 
-    for pred, gt in zip(predictions, targets):
-        # ── 过滤低置信度预测 ──
-        scores = pred["scores"].cpu().numpy()
-        keep   = scores >= score_thresh
+    def __init__(self, iou_thresh: float = 0.5, score_thresh: float = 0.3):
+        self.iou_thresh  = iou_thresh
+        self.score_thresh = score_thresh
+        # AP50 需要：每个预测的置信度 + 是否 TP
+        self._scores: List[float] = []
+        self._is_tp:  List[bool]  = []
+        self._n_gt:   int         = 0
+        # F1 辅助计数器
+        self._tp = self._fp = self._fn = 0
 
-        pred_masks_raw = pred["masks"][keep].cpu().numpy()     # (N,1,H,W) float 或 (N,H,W) bool
-        gt_masks_raw   = gt["masks"].cpu().numpy()             # (M, H, W) bool
+    def update(self, pred: dict, gt: dict) -> None:
+        """
+        推入单张图像的预测和真值，完成 IoU 匹配后立即丢弃掩膜张量。
 
-        # 兼容两种格式：validate 阶段已提前二值化为 (N,H,W) bool；
-        # evaluate.py 传入的仍是原始 (N,1,H,W) float32，在此按需处理
-        if len(pred_masks_raw) == 0:
-            pred_masks = np.zeros((0, *gt_masks_raw.shape[1:]), dtype=bool)
-        elif pred_masks_raw.ndim == 4:
-            pred_masks = (pred_masks_raw[:, 0] > 0.5)
+        pred 须含:
+            masks  (N, H, W) bool  或  (N, 1, H, W) float32
+            scores (N,) float32
+        gt 须含:
+            masks  (M, H, W) bool
+        """
+        scores        = pred["scores"].cpu().numpy()           # (N,)
+        pred_masks_raw = pred["masks"].cpu().numpy()           # (N,1,H,W) or (N,H,W)
+        gt_masks      = gt["masks"].cpu().numpy().astype(bool) # (M, H, W)
+
+        # 统一为 (N, H, W) bool
+        if pred_masks_raw.ndim == 4:
+            pred_masks = pred_masks_raw[:, 0] > 0.5
         else:
             pred_masks = pred_masks_raw.astype(bool)
-        gt_masks = gt_masks_raw.astype(bool)
+
+        # GT mask 降采样与预测 mask 对齐（训练验证阶段已在 GPU 端 stride-4 降采样）
+        # 避免在 CPU 上对 512×512 做大规模矩阵乘法；训练中趋势跟踪精度损失可忽略
+        if pred_masks.shape[-1] > 0 and gt_masks.shape[-1] != pred_masks.shape[-1]:
+            sh = gt_masks.shape[-2] // pred_masks.shape[-2]
+            sw = gt_masks.shape[-1] // pred_masks.shape[-1]
+            if sh > 1 or sw > 1:
+                gt_masks = gt_masks[:, ::max(sh, 1), ::max(sw, 1)]
 
         n_pred = len(pred_masks)
         n_gt   = len(gt_masks)
+        self._n_gt += n_gt
 
-        if n_gt == 0 and n_pred == 0:
-            continue
-
+        # ── 无 GT：所有预测均为 FP ──
         if n_gt == 0:
-            total_fp += n_pred
-            continue
+            self._scores.extend(scores.tolist())
+            self._is_tp.extend([False] * n_pred)
+            self._fp += int((scores >= self.score_thresh).sum())
+            return
 
+        # ── 无预测：所有 GT 均为 FN ──
         if n_pred == 0:
-            total_fn += n_gt
-            continue
+            self._fn += n_gt
+            return
 
-        # 贪心匹配
-        matched_ious = _greedy_match(pred_masks, gt_masks, iou_thresh)
-        n_matched = len(matched_ious)
+        # ── 构建 IoU 矩阵 (n_pred, n_gt)：向量化版本 ──
+        # 原双层 Python 循环是 O(n_pred × n_gt × H×W)，模型收敛后 n_pred 暴涨导致验证越来越慢
+        # 矩阵乘法版本：inter = pred_flat @ gt_flat.T，由 BLAS 处理，速度提升 10-100×
+        pred_flat  = pred_masks.reshape(n_pred, -1).astype(np.float32)  # (n_pred, H*W)
+        gt_flat    = gt_masks.reshape(n_gt, -1).astype(np.float32)      # (n_gt, H*W)
+        inter      = pred_flat @ gt_flat.T                               # (n_pred, n_gt)
+        pred_area  = pred_flat.sum(1, keepdims=True)                    # (n_pred, 1)
+        gt_area    = gt_flat.sum(1, keepdims=True).T                    # (1, n_gt)
+        union      = pred_area + gt_area - inter
+        with np.errstate(invalid="ignore", divide="ignore"):
+            iou_matrix = np.where(union > 0, inter / union, 1.0).astype(np.float32)
 
-        all_ious.extend(matched_ious)
-        total_tp += n_matched
-        total_fp += n_pred - n_matched
-        total_fn += n_gt   - n_matched
+        # ── AP50 匹配：按置信度从高到低，每个 GT 至多匹配一次 ──
+        score_order    = np.argsort(-scores)
+        matched_gt_ap: set = set()
+        for pi in score_order:
+            row = iou_matrix[pi].copy()
+            if matched_gt_ap:
+                row[list(matched_gt_ap)] = -1.0
+            best_gi = int(np.argmax(row))
+            is_tp   = row[best_gi] >= self.iou_thresh
+            if is_tp:
+                matched_gt_ap.add(best_gi)
+            self._scores.append(float(scores[pi]))
+            self._is_tp.append(is_tp)
 
-    # ── 汇总指标 ──
-    mean_iou  = float(np.mean(all_ious)) if all_ious else 0.0
-    precision = total_tp / (total_tp + total_fp + 1e-8)
-    recall    = total_tp / (total_tp + total_fn + 1e-8)
-    f1        = 2 * precision * recall / (precision + recall + 1e-8)
+        # ── F1 匹配：过滤低置信度后按 IoU 贪心匹配 ──
+        keep     = scores >= self.score_thresh
+        n_kept   = int(keep.sum())
+        if n_kept == 0:
+            self._fn += n_gt
+        else:
+            kept_iou = iou_matrix[keep]
+            matched_pred_f1: set = set()
+            matched_gt_f1:  set = set()
+            flat_order = np.dstack(np.unravel_index(
+                np.argsort(-kept_iou.ravel()), kept_iou.shape
+            ))[0]
+            for pi, gi in flat_order:
+                if pi in matched_pred_f1 or gi in matched_gt_f1:
+                    continue
+                if kept_iou[pi, gi] < self.iou_thresh:
+                    break
+                matched_pred_f1.add(pi)
+                matched_gt_f1.add(gi)
+            n_match   = len(matched_gt_f1)
+            self._tp += n_match
+            self._fp += n_kept - n_match
+            self._fn += n_gt   - n_match
 
-    return {
-        "val_mask_iou":  mean_iou,
-        "val_precision": float(precision),
-        "val_recall":    float(recall),
-        "val_f1":        float(f1),
-    }
+    def compute(self) -> Dict[str, float]:
+        """汇总所有已推入图像，返回最终指标字典。"""
+        # AP50
+        if self._n_gt == 0 or not self._scores:
+            ap50 = 0.0
+        else:
+            order      = np.argsort(-np.array(self._scores))
+            tp_arr     = np.array(self._is_tp, dtype=np.float32)[order]
+            tp_cumsum  = np.cumsum(tp_arr)
+            fp_cumsum  = np.cumsum(1.0 - tp_arr)
+            recalls    = tp_cumsum / self._n_gt
+            precisions = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-8)
+            recalls    = np.concatenate([[0.0], recalls])
+            precisions = np.concatenate([[1.0], precisions])
+            ap50 = _compute_ap_101(recalls, precisions)
+
+        # F1 辅助
+        precision = self._tp / (self._tp + self._fp + 1e-8)
+        recall    = self._tp / (self._tp + self._fn + 1e-8)
+        f1        = 2 * precision * recall / (precision + recall + 1e-8)
+
+        return {
+            "val_ap50":      float(ap50),
+            "val_precision": float(precision),
+            "val_recall":    float(recall),
+            "val_f1":        float(f1),
+        }
+
+
+# ──────────────────────────────────────────────────────────────────
+# 批量接口（向后兼容，evaluate.py 仍可直接调用）
+# ──────────────────────────────────────────────────────────────────
+
+def compute_instance_metrics(
+    predictions:  List[Dict[str, torch.Tensor]],
+    targets:      List[Dict[str, torch.Tensor]],
+    iou_thresh:   float = 0.5,
+    score_thresh: float = 0.3,
+) -> Dict[str, float]:
+    """
+    批量计算实例分割指标。内部使用 InstanceMetricsAccumulator，
+    内存占用与流式版本一致（不会因数据集大小而暴涨）。
+    """
+    acc = InstanceMetricsAccumulator(iou_thresh=iou_thresh, score_thresh=score_thresh)
+    for pred, gt in zip(predictions, targets):
+        acc.update(pred, gt)
+    return acc.compute()

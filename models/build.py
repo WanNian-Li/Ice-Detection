@@ -11,12 +11,18 @@ models/build.py
 import torch.nn as nn
 
 from models.mask_rcnn import build_mask_rcnn, get_mask_rcnn_params
+from models.mask2former import build_mask2former, get_mask2former_params
 from models.unet import build_unet
+from models.yolo import build_yolo, get_yolo_params
+from models.sam2_wrapper import build_sam2_model, get_sam2_params
 
 # 支持的架构名称映射
 _ARCH_REGISTRY = {
-    "mask_rcnn": build_mask_rcnn,
-    "unet":      build_unet,
+    "mask_rcnn":   build_mask_rcnn,
+    "mask2former": build_mask2former,
+    "unet":        build_unet,
+    "yolo":        build_yolo,
+    "sam2":        build_sam2_model,
 }
 
 
@@ -69,9 +75,15 @@ def build_optimizer(cfg, model: nn.Module):
     lr      = float(opt_cfg.lr)
     wd      = float(opt_cfg.weight_decay)
 
-    # Mask R-CNN 使用差异化参数组
+    # 差异化参数组（backbone × 0.1 vs head）
     if cfg.model.architecture == "mask_rcnn":
         param_groups = get_mask_rcnn_params(model, lr=lr, weight_decay=wd)
+    elif cfg.model.architecture == "mask2former":
+        param_groups = get_mask2former_params(model, lr=lr, weight_decay=wd)
+    elif cfg.model.architecture == "yolo":
+        param_groups = get_yolo_params(model, lr=lr, weight_decay=wd)
+    elif cfg.model.architecture == "sam2":
+        param_groups = get_sam2_params(model, lr=lr, weight_decay=wd)
     else:
         param_groups = [{"params": model.parameters(), "lr": lr, "weight_decay": wd}]
 

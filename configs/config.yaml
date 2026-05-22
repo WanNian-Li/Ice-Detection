@@ -13,10 +13,10 @@
 # ──────────────────────────────────────────
 # 1. 项目基础路径（所有相对路径均以 project_root 为基准）
 # ──────────────────────────────────────────
-project_root: "/content/drive/MyDrive/Iceberg-Detection"
+project_root: "/root/code/Iceberg-Detection"
 
 paths:
-  # 原始数据（支持单目录字符串或多目录列表）
+  # 原始数据 Colab，不在autoDL
   raw_sar_dirs:
     - "/content/drive/MyDrive/HH_201810_Mosaic"
     - "/content/drive/MyDrive/HH_201910_Mosaic"   # 追加更多目录
@@ -26,14 +26,14 @@ paths:
     - "/content/drive/MyDrive/HH_202310_Mosaic"
   raw_vector_dir:   "data/raw/vectors"      # .gpkg 矢量轮廓存放目录
 
-  # 预处理后的切片数据
-  processed_dir:    "data/processed"
-  patch_image_dir:  "data/processed/images" # 切好的图像块 (.npy)
-  patch_mask_dir:   "data/processed/masks"  # 对应的掩膜块 (.npy)
-  split_dir:        "data/processed/splits" # train/val/test 划分列表 (.csv)
+  # 预处理后的切片数据 Colab——对AutoDL无效
+  # processed_dir:    "data/processed"
+  # patch_image_dir:  "data/processed/images" # 切好的图像块 (.npy)
+  # patch_mask_dir:   "data/processed/masks"  # 对应的掩膜块 (.npy)
+  # split_dir:        "data/processed/splits" # train/val/test 划分列表 (.csv)
 
   # HDF5 打包数据（由 data_prep/pack_hdf5.py 生成）
-  hdf5_dir:         "/content/hdf5"   # train.h5 / val.h5 / test.h5 所在目录
+  hdf5_dir:         "/root/autodl-tmp/hdf5"   # train.h5 / val.h5 / test.h5 所在目录
 
   # 输出
   checkpoint_dir:   "outputs/checkpoints"   # 模型权重保存目录
@@ -48,6 +48,9 @@ data_prep:
   overlap: 64               # 相邻切片重叠像素数（用于避免边界效应）
   min_iceberg_pixels: 10    # 掩膜中冰山像素数低于此值的切片将被丢弃
                             # 数据集最小冰山 ~0.04km²≈25px，原50会丢弃小目标正样本
+  background_patch_ratio: 0.5  # 每个前景切片对应随机采样的纯背景切片比例
+                                # 0 = 不采样；0.5 = 每 2 个前景 patch 保留 1 个背景 patch
+                                # 背景 patch 需通过 NaN 检查，掩膜全为 0
   target_crs: "EPSG:3031"   # 目标坐标系（南极极射赤面投影）
   vector_burn_value: 1      # 矢量烧录到掩膜时的像素值（前景=1，背景=0）
   nodata_value: 0           # SAR 影像无数据区域的填充值
@@ -55,7 +58,6 @@ data_prep:
   target_resolution: 40     # 重投影后目标分辨率（米），None 则保持原始分辨率
   max_nan_ratio: 0.3        # 切片中 NaN 像素比例超过此值则丢弃
   resume_enabled: false     # 场景级断点续跑：true 时跳过已完成场景
-  resume_verify_files: true # 启用后会校验完成标记与已保存切片数是否一致
   spatial_buffer_m: 0       # 空间过滤时对 SAR 边界框的扩展缓冲（米）。
                             # 当 SAR 边界与矢量几乎不重叠时可设置为 5000–50000 进行测试，
                             # 正式训练时保持 0（避免掩膜错位）。
@@ -67,6 +69,16 @@ data_prep:
     db_clip_max: 5.0        # 截断上限（dB）：实测 max=+6.3dB，保留最亮冰山目标
     percentile_low: 2       # 仅 percentile 方式使用
     percentile_high: 98     # 仅 percentile 方式使用
+
+  # 离线 RTV 平滑（在 dB → 归一化之前执行，对应论文 MATLAB writesliceres.m）
+  # 启用后需重新运行 prepare_dataset.py 生成新的 .npy 文件
+  # 注意：512×512 patch 约 0.5–2 秒/片，全量预处理耗时较长，建议先用小样本测试效果
+  tv_smooth:
+    enabled: false            # 改为 true 以启用离线 RTV
+    weight: 0.01              # lambda：平滑强度 (0, 0.05]
+    sigma: 3.0                # 纹理尺度（像素）(0, 6]
+    sharpness: 0.005          # epsilon_s [1e-3, 0.03]
+    max_iter: 4               # 迭代次数
 
   # 数据集划分比例
   split_ratio:
@@ -83,6 +95,37 @@ dataset:
   input_channels: 1         # 输入通道数（单极化 SAR = 1，双极化 = 2）
   image_size: 512           # 送入模型的图像尺寸（可与 patch_size 不同，会自动缩放）
 
+  # 在线 SAR 斑点降噪（Dataset.__getitem__ 中执行，不需要重新跑预处理）
+  despeckle:
+    enabled: false            # TV 已离线预计算并存入 HDF5，在线滤波关闭以释放 CPU 给 GPU 喂数据
+    method: "lee"             # "lee" | "enhanced_lee" | "frost" | "gamma_map" | "tv" | "bilateral" | "median"
+    lee:
+      window_size: 7          # 滤波窗口大小（奇数）
+      sigma: 0.06             # 噪声标准差（[0,1] 域下估值）
+                              # S1 EW GRD (ENL≈4): sigma ≈ 4.343/sqrt(4)/35 ≈ 0.062
+                              # 调大 → 更强平滑；调小 → 更保边
+    enhanced_lee:
+      window_size: 7
+      sigma: 0.06             # 含义同 lee.sigma
+    frost:
+      window_size: 7
+      damping: 2.0            # 阻尼系数（>0），越大平滑越强
+      sigma: 0.06             # 含义同 lee.sigma
+    gamma_map:
+      window_size: 7
+      n_looks: 4.0            # 等效视数（ENL），S1 EW GRD 典型值 4–5
+    tv:
+      weight: 0.01            # RTV lambda 平滑权重 (0, 0.05]，旧值 0.1 过强
+      sigma: 3.0              # 纹理元素最大尺度（像素），(0, 6]
+      sharpness: 0.005        # 边缘锐度 epsilon_s，[1e-3, 0.03]
+      max_iter: 4             # 迭代次数，与 tsmooth.m 默认值一致
+    bilateral:
+      d: 5                    # 滤波窗口直径
+      sigma_color: 0.1        # 颜色空间 sigma（[0,1] 尺度下 0.1≈25.5 灰度级）
+      sigma_space: 5          # 坐标空间 sigma
+    median:
+      kernel_size: 3          # 滤波核大小（奇数）
+
   # 数据增强（仅训练集启用）
   augmentation:
     enabled: true
@@ -95,18 +138,20 @@ dataset:
     # SAR dB 归一化值具有绝对物理意义，像素级扰动会破坏冰山/海水阈值
 
 dataloader:
-  batch_size: 16            # 5090 32GB 可用 16；若显存不足降回 8
-  num_workers: 8            # AutoDL 5090 实例通常有 8~16 CPU core
+  batch_size: 4            # 离线预处理后无 CPU 瓶颈，5090 32GB 可安全开到 32
+  num_workers: 4           # HDF5 读取极快，12 个 worker 足够维持 GPU 满载；可继续上调至 16
   pin_memory: true
   shuffle_train: true
   max_patches_per_epoch: 10000  # null = 全量；正整数 = 每 epoch 训练集随机采样该数量（不放回）
+  max_val_patches: 2000         # null = 全量验证；正整数 = 每 epoch 验证集随机采样该数量
+                                # 训练中追踪趋势用 2000 足够；最终评估用 evaluate.py（全量）
   use_hdf5: True           # true = 优先从 paths.hdf5_dir 读取 .h5 文件（需先运行 pack_hdf5.py）
 
 # ──────────────────────────────────────────
 # 4. 模型参数 (models)
 # ──────────────────────────────────────────
 model:
-  # 选择模型架构: "mask_rcnn" | "unet" | "unet_plus_plus"
+  # 选择模型架构: "mask_rcnn" | "mask2former" | "unet" | "yolo" | "sam2"
   architecture: "mask_rcnn"
 
   # ---- Mask R-CNN 专用参数 ----
@@ -153,6 +198,74 @@ model:
     decoder_channels: [256, 128, 64, 32, 16]
     in_channels: 1                # 与 dataset.input_channels 一致
     num_classes: 1                # 二分类输出 1 通道（sigmoid），非 2 通道 softmax
+
+  # ---- Mask2Former 专用参数（实例分割，Swin-B/L 骨干）----
+  mask2former:
+    backbone: "swin_b"            # "swin_b" | "swin_l"
+                                  # swin_b: Swin-Base，~200M 参数，建议 batch_size ≤ 8
+                                  # swin_l: Swin-Large，~300M 参数，建议 batch_size ≤ 4
+    pretrained_backbone: true     # true: 从 COCO 预训练权重加载骨干+解码器，分类头重新初始化
+                                  # false: 纯随机初始化（仅 debug/消融使用）
+    num_labels: 1                 # 前景类数（冰山=1）；背景由 no-object query 隐式处理，无需加 1
+    normalize_imagenet: true      # Swin 骨干以 ImageNet 均值/标准差预训练，保持 true
+                                  # Dataset 输出 SAR [0,1]，wrapper 内部自动做 ImageNet 归一化
+
+    # 预训练权重来源（pretrained_backbone=true 时）
+    # swin_b: facebook/mask2former-swin-base-coco-instance  (~500MB)
+    # swin_l: facebook/mask2former-swin-large-coco-instance (~900MB)
+    #
+    # [方案 A] 自动下载（代码已默认使用 hf-mirror.com 镜像，中国大陆服务器可用）
+    # local_model_path: null
+    #
+    # [方案 B] 完全离线：在有网络的机器上提前下载，再上传到服务器
+    #   huggingface-cli download facebook/mask2former-swin-base-coco-instance \
+    #       --local-dir /root/autodl-tmp/mask2former-swin-b
+    #   然后将下面的 null 替换为本地路径：
+    local_model_path: null          # null = 自动下载；填路径 = 完全离线
+
+    # 推理阈值（低于此分数的 query 被丢弃）
+    score_threshold: 0.05         # 与 Mask R-CNN box_score_thresh=0.05 对齐
+                                  # 保持低值以输出充足候选供评估器计算 AP 曲线
+    mask_threshold: 0.5           # 掩膜概率图 sigmoid 后的二值化阈值
+
+  # ---- SAM2 专用参数（实例分割，提示式掩膜解码器）----
+  sam2:
+    version: "2.1"             # "2.1"（推荐，SAM2.1）| "2"（原始 SAM2.0）
+    variant: "tiny"            # "tiny" | "small" | "base_plus" | "large"
+                               # tiny:  ~39M 参数，训练最快，batch_size 可开到 16
+                               # small: ~46M 参数，精度/速度均衡
+                               # base_plus: ~80M 参数，建议 batch_size ≤ 8
+                               # large: ~224M 参数，建议 batch_size ≤ 4
+
+    # 权重路径：null = 自动从 SAM2 包的 checkpoints/ 目录查找；
+    # 若未找到则需手动下载后填入绝对路径，例如：
+    #   /root/autodl-tmp/sam2.1_hiera_tiny.pt
+    checkpoint_path: null
+
+    # 微调策略
+    freeze_image_encoder: true   # true（推荐）：仅训练提示编码器 + 掩膜解码器
+                                 # false：同时微调图像编码器（lr × 0.01），需更多显存
+
+    # 推理阈值
+    score_threshold: 0.88        # stability_score 低于此值的候选掩膜被丢弃
+    mask_threshold: 0.5          # logit sigmoid 后的二值化阈值
+
+    # SAM2AutomaticMaskGenerator 推理参数
+    # 密集点网格 → 候选掩膜 → 按 stability_score + NMS 过滤
+    points_per_side: 32          # 每边点数；32 = 1024 个点，覆盖 512×512 图像
+                                 # 提高此值可检测更小目标，但推理时间线性增加
+    pred_iou_thresh: 0.70        # 掩膜解码器自身 IoU 预测低于此值则丢弃
+    stability_score_thresh: 0.85 # 掩膜稳定性分数阈值（对阈值鲁棒性的量化指标）
+    box_nms_thresh: 0.70         # 跨掩膜 NMS IoU 阈值（去除重叠实例）
+
+    multimask_output: false      # false：每个提示输出 1 个掩膜（训练用）
+                                 # true：每个提示输出 3 个候选，取最高分（消融用）
+
+  # ---- YOLO 专用参数 ----
+  yolo:
+    model: "models/yolo11s-seg.pt"      # 模型变体: yolo11n/s/m/l/x-seg.pt（首次运行自动下载）
+    num_classes: 1                # 前景类数量（冰山=1，YOLO 内部 0-indexed 自动处理）
+    freeze_backbone: false        # SAR→自然图像域差距大，开放骨干低 LR 微调比完全冻结效果更好
 
 # ──────────────────────────────────────────
 # 5. 训练参数 (train)
@@ -202,15 +315,15 @@ train:
     save_best: true            # 是否保存验证集最佳模型
     save_last: true            # 是否保存最新 epoch 的模型
     save_every_n_epochs: 5     # 每 N 个 epoch 额外保存一次
-    monitor_metric: "val_mask_iou"  # 监控的验证指标
+    monitor_metric: "val_ap50"      # 监控的验证指标（AP@IoU=0.5，对所有置信度阈值积分）
     mode: "max"                # "max" 表示越大越好
 
   # 日志记录
   logging:
-    use_tensorboard: true
-    use_wandb: false
-    wandb_project: "iceberg-detection"
-    wandb_entity: null         # 你的 wandb 用户名
+    use_tensorboard: false
+    use_wandb: true
+    wandb_project: "Iceberg-Detection"
+    wandb_entity: "liwannian-zhejiang-university"         # 你的 wandb 用户名
     log_every_n_steps: 10      # 每 N 个 step 记录一次损失
 
   # 设备

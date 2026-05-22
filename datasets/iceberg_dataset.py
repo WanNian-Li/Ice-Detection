@@ -32,6 +32,8 @@ import torch
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 
+from utils.despeckle import get_despeckle_fn
+
 # ──────────────────────────────────────────────────────────────────
 # 数据增强流水线构建
 # ──────────────────────────────────────────────────────────────────
@@ -136,6 +138,10 @@ class IcebergDataset(Dataset):
         self.architecture = cfg.model.architecture  # "mask_rcnn" | "unet"
         self.input_channels = int(cfg.dataset.input_channels)
 
+        # ── 在线斑点降噪配置 ──
+        self.despeckle_fn, self.despeckle_kwargs = get_despeckle_fn(cfg)
+        self.despeckle_enabled = self.despeckle_fn is not None
+
         # ── 加载元数据 CSV ──
         csv_path = Path(csv_path)
         if not csv_path.exists():
@@ -152,6 +158,12 @@ class IcebergDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
+    def _despeckle(self, image: np.ndarray) -> np.ndarray:
+        """在线 SAR 斑点降噪（由配置控制启用/禁用与方法选择）。"""
+        if not self.despeckle_enabled:
+            return image
+        return self.despeckle_fn(image, **self.despeckle_kwargs)
+
     def __getitem__(self, idx: int):
         """
         返回单个样本。
@@ -161,27 +173,27 @@ class IcebergDataset(Dataset):
         image = np.load(row["image_path"])   # (H, W)，float32，[0, 1]
         mask  = np.load(row["mask_path"])    # (H, W)，uint16，值=冰山实例 ID
 
+        # ── 在线 SAR 斑点降噪（仅对图像做，掩膜不变）──
+        image = self._despeckle(image)
+
         # ── 通道扩展：albumentations 要求输入为 (H, W, C) ──
-        # 单通道 SAR 图像重复 3 通道（Mask R-CNN 的 ResNet 骨干需要 3 通道输入）
-        if self.architecture == "mask_rcnn":
+        # mask_rcnn / mask2former / yolo 均需要 3 通道输入；unet 保持单通道
+        if self.architecture in ("mask_rcnn", "mask2former", "yolo"):
             image_hwc = np.stack([image] * 3, axis=-1)  # (H, W, 3)
         else:
-            # U-Net 可直接使用单通道
             image_hwc = image[..., np.newaxis]           # (H, W, 1)
 
         # ── 执行数据增强 ──
         augmented = self.transform(image=image_hwc, mask=mask)
         image_tensor = augmented["image"].float()   # (C, H, W)，ToTensorV2 已转换
-        mask_aug     = augmented["mask"]            # Tensor (H, W)，uint8
+        mask_aug     = augmented["mask"]            # Tensor (H, W)
 
         # ── 按架构封装返回值 ──
-        if self.architecture == "mask_rcnn":
-            target = self._build_maskrcnn_target(mask_aug, idx)
-            return image_tensor, target
+        if self.architecture in ("mask_rcnn", "mask2former", "yolo"):
+            return image_tensor, self._build_maskrcnn_target(mask_aug, idx)
         else:
-            # U-Net 二分类：掩膜转为 float32 二值图（0.0=背景, 1.0=冰山）
-            # 用于 BCEWithLogitsLoss；ID > 0 的像素均视为冰山前景
-            return image_tensor, (mask_aug > 0).float()
+            # U-Net 二分类：掩膜转为 float32 二值图
+            return image_tensor, (mask_aug.int() > 0).float()
 
     # ────────────────────────────────────────
     # Mask R-CNN 目标字典构建
@@ -293,6 +305,11 @@ class IcebergHDF5Dataset(IcebergDataset):
         self.cfg = cfg
         self.architecture = cfg.model.architecture
         self.input_channels = int(cfg.dataset.input_channels)
+
+        # ── 在线斑点降噪配置 ──
+        self.despeckle_fn, self.despeckle_kwargs = get_despeckle_fn(cfg)
+        self.despeckle_enabled = self.despeckle_fn is not None
+
         self.h5_path = Path(h5_path)
         self.transform = transform or build_augmentation_pipeline(cfg, split)
         self._h5 = None   # 懒加载，每个 worker 独立打开
@@ -318,11 +335,13 @@ class IcebergHDF5Dataset(IcebergDataset):
 
     def __getitem__(self, idx: int):
         f = self._get_h5()
-        image = f["images"][idx]   # (H, W)，float32，[0, 1]
-        mask  = f["masks"][idx]    # (H, W)，uint16，值=冰山实例 ID
+        image = f["images"][idx]              # (H, W)，float32，[0, 1]
+        mask  = f["masks"][idx].astype(np.int32)  # uint16 → int32，PyTorch 不支持 uint16 比较
 
-        # 通道扩展（与 IcebergDataset 完全一致）
-        if self.architecture == "mask_rcnn":
+        # ── 在线 SAR 斑点降噪 ──
+        image = self._despeckle(image)
+
+        if self.architecture in ("mask_rcnn", "mask2former", "yolo"):
             image_hwc = np.stack([image] * 3, axis=-1)   # (H, W, 3)
         else:
             image_hwc = image[..., np.newaxis]            # (H, W, 1)
@@ -331,10 +350,10 @@ class IcebergHDF5Dataset(IcebergDataset):
         image_tensor = augmented["image"].float()
         mask_aug     = augmented["mask"]
 
-        if self.architecture == "mask_rcnn":
+        if self.architecture in ("mask_rcnn", "mask2former", "yolo"):
             return image_tensor, self._build_maskrcnn_target(mask_aug, idx)
         else:
-            return image_tensor, (mask_aug > 0).float()
+            return image_tensor, (mask_aug.int() > 0).float()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -371,50 +390,38 @@ def build_dataloaders(cfg) -> Tuple[DataLoader, DataLoader, DataLoader]:
 
     Returns:
         (train_loader, val_loader, test_loader)
-        若某个分割的数据文件不存在，对应 DataLoader 返回 None 并打印警告。
     """
-    split_dir = Path(cfg.paths.split_dir)
-    dl_cfg    = cfg.dataloader
-    arch      = cfg.model.architecture
+    dl_cfg = cfg.dataloader
+    arch   = cfg.model.architecture
 
-    use_hdf5 = bool(dl_cfg.get("use_hdf5", False))
-    hdf5_dir = Path(cfg.paths.get("hdf5_dir", "data/processed/hdf5")) if use_hdf5 else None
+    hdf5_dir = Path(cfg.paths.hdf5_dir)
 
-    # Mask R-CNN 需要特殊的 collate_fn
-    collate = maskrcnn_collate_fn if arch == "mask_rcnn" else None
+    # mask_rcnn / mask2former / yolo 均使用 list-of-dict 格式的 batch
+    collate = maskrcnn_collate_fn if arch in ("mask_rcnn", "mask2former", "yolo") else None
 
     loaders = {}
     for split in ("train", "val", "test"):
-        dataset = None
-
-        # ── 优先尝试 HDF5 ──
-        if hdf5_dir is not None:
-            h5_path = hdf5_dir / f"{split}.h5"
-            if h5_path.exists():
-                dataset = IcebergHDF5Dataset(h5_path=h5_path, split=split, cfg=cfg)
-                print(f"[DataLoader] {split:5s}: HDF5  {str(h5_path):<50s} ({len(dataset)} 个样本)")
-            else:
-                print(f"[DataLoader] 警告：{h5_path} 不存在，{split} 回退到 CSV 模式。")
-
-        # ── 回退到 CSV + npy ──
-        if dataset is None:
-            csv_path = split_dir / f"{split}.csv"
-            if not csv_path.exists():
-                print(f"[DataLoader] 警告：{csv_path} 不存在，{split} DataLoader 返回 None。")
-                loaders[split] = None
-                continue
-            dataset = IcebergDataset(csv_path=csv_path, split=split, cfg=cfg)
+        h5_path = hdf5_dir / f"{split}.h5"
+        if not h5_path.exists():
+            raise FileNotFoundError(
+                f"HDF5 文件不存在: {h5_path}\n"
+                f"请先运行 data_prep/pack_hdf5.py 生成数据集。"
+            )
+        dataset = IcebergHDF5Dataset(h5_path=h5_path, split=split, cfg=cfg)
+        print(f"[DataLoader] {split:5s}: HDF5  {str(h5_path):<50s} ({len(dataset)} 个样本)")
 
         is_train = (split == "train")
 
-        # ── 训练集子集采样：每 epoch 随机取 max_patches_per_epoch 个样本 ──
+        # ── 子集采样：训练集按 max_patches_per_epoch，验证集按 max_val_patches ──
         sampler = None
         shuffle = is_train and bool(dl_cfg.shuffle_train)
         if is_train:
             max_n = int(dl_cfg.get("max_patches_per_epoch") or 0)
-            if 0 < max_n < len(dataset):
-                sampler = RandomSampler(dataset, replacement=False, num_samples=max_n)
-                shuffle = False   # sampler 与 shuffle 互斥
+        else:
+            max_n = int(dl_cfg.get("max_val_patches") or 0) if split == "val" else 0
+        if 0 < max_n < len(dataset):
+            sampler = RandomSampler(dataset, replacement=False, num_samples=max_n)
+            shuffle = False   # sampler 与 shuffle 互斥
 
         n_workers_train = int(dl_cfg.num_workers)
         # 验证/测试：减少 worker 数、关闭 persistent_workers，防止 /dev/shm 耗尽导致 SIGINT

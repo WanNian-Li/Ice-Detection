@@ -41,7 +41,7 @@ from models.build import build_model, build_optimizer, build_scheduler
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.logger import get_logger, get_tb_writer, get_wandb_run
 from utils.losses import build_seg_loss
-from utils.metrics import compute_instance_metrics, compute_semantic_iou
+from utils.metrics import InstanceMetricsAccumulator, compute_semantic_iou
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -212,7 +212,7 @@ def validate(model, loader, cfg, epoch, tb_writer, logger) -> dict:
     device = next(model.parameters()).device
     arch   = cfg.model.architecture
 
-    if arch == "mask_rcnn":
+    if arch in ("mask_rcnn", "mask2former", "yolo", "sam2"):
         metrics = _validate_maskrcnn(model, loader, cfg, device)
     else:
         metrics = _validate_unet(model, loader, cfg, device)
@@ -229,30 +229,42 @@ def validate(model, loader, cfg, epoch, tb_writer, logger) -> dict:
 
 
 def _validate_maskrcnn(model, loader, cfg, device) -> dict:
-    """Mask R-CNN 验证：收集所有预测和真值，统一计算实例级指标。"""
-    all_preds   = []
-    all_targets = []
-    score_thresh = float(cfg.evaluate.score_threshold)
-
-    for images, targets in tqdm(loader, desc="  Validating", ncols=80, leave=False):
-        images = [img.to(device) for img in images]
-        preds  = model(images)    # eval 模式直接返回预测结果
-
-        # 将预测转回 CPU，masks 提前二值化：(N,1,H,W) float32 → (N,H,W) bool
-        # 节省 4× 内存，防止大验证集 OOM（50GB float → 12GB bool）
-        for p in preds:
-            p_cpu = {k: v.cpu() for k, v in p.items()}
-            if "masks" in p_cpu and p_cpu["masks"].numel() > 0:
-                p_cpu["masks"] = (p_cpu["masks"].squeeze(1) > 0.5)
-            all_preds.append(p_cpu)
-        all_targets.extend([{k: v.cpu() for k, v in t.items()} for t in targets])
-        torch.cuda.empty_cache()
-
-    return compute_instance_metrics(
-        all_preds, all_targets,
+    """
+    流式验证：逐图推入累加器，IoU 匹配后立即丢弃掩膜，全程只保留标量。
+    内存占用 O(N_pred) 而非 O(N_pred × H × W)，彻底消除验证 OOM。
+    """
+    acc = InstanceMetricsAccumulator(
         iou_thresh=float(cfg.evaluate.iou_thresholds[0]),
-        score_thresh=score_thresh,
+        score_thresh=float(cfg.evaluate.score_threshold),
     )
+
+    for batch_idx, (images, targets) in enumerate(
+        tqdm(loader, desc="  Validating", ncols=80, leave=False)
+    ):
+        images = [img.to(device) for img in images]
+        preds  = model(images)
+
+        for pred, gt in zip(preds, targets):
+            # GPU 上先将 mask 降采样到 128×128 再传 CPU：
+            #   - 512×512 → 128×128 减少 16× PCIe 传输量（300mask × 1MB → 300mask × 64KB）
+            #   - 后续 IoU 矩阵也缩小 16×，训练验证精度损失可忽略
+            if pred.get("masks") is not None and pred["masks"].numel() > 0:
+                m = pred["masks"]                        # (N, 1, H, W) float32
+                pred = {**pred, "masks": m[:, :, ::4, ::4]}  # → (N, 1, 128, 128)
+
+            pred_cpu = {k: v.cpu() for k, v in pred.items()}
+            if pred_cpu.get("masks", torch.tensor([])).numel() > 0:
+                pred_cpu["masks"] = (pred_cpu["masks"].squeeze(1) > 0.5)
+            acc.update(pred_cpu, {k: v.cpu() for k, v in gt.items()})
+
+        del preds, images
+        # 每 50 个 batch 清理一次显存，避免逐 batch 调用 CUDA 同步（原因：
+        # empty_cache 每次触发 CUDA stream sync，1000+ batch 累计 100-300s 额外开销）
+        if batch_idx % 50 == 49:
+            torch.cuda.empty_cache()
+
+    torch.cuda.empty_cache()
+    return acc.compute()
 
 
 def _validate_unet(model, loader, cfg, device) -> dict:
@@ -367,7 +379,7 @@ def main():
         epoch_start = time.time()
 
         # ── 训练 ──
-        if arch == "mask_rcnn":
+        if arch in ("mask_rcnn", "mask2former", "yolo", "sam2"):
             train_loss = train_one_epoch_maskrcnn(
                 model, optimizer, train_loader, scaler, cfg, epoch, tb_writer, logger
             )
