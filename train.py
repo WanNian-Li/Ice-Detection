@@ -25,6 +25,7 @@ import argparse
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -38,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from configs.config_parser import get_config, save_config
 from datasets.iceberg_dataset import build_dataloaders
 from models.build import build_model, build_optimizer, build_scheduler
-from utils.checkpoint import load_checkpoint, save_checkpoint
+from utils.checkpoint import load_checkpoint, save_checkpoint, save_last_checkpoint
 from utils.logger import get_logger, get_tb_writer, get_wandb_run
 from utils.losses import build_seg_loss
 from utils.metrics import InstanceMetricsAccumulator, compute_semantic_iou
@@ -304,6 +305,17 @@ def main():
 
     arch = cfg.model.architecture
 
+    # ── Run ID：与日志文件名保持一致，用于 checkpoint 子目录命名 ──
+    run_id   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"train_{run_id}"
+
+    # checkpoint 保存到 outputs/checkpoints/train_YYYYMMDD_HHMMSS/
+    cfg = OmegaConf.merge(cfg, OmegaConf.create({
+        "paths": {
+            "checkpoint_dir": str(Path(cfg.paths.checkpoint_dir) / run_name)
+        }
+    }))
+
     # ── 1. 设备 ──────────────────────────────────────────────────
     if cfg.train.device == "cuda" and torch.cuda.is_available():
         device = torch.device("cuda", cfg.train.gpu_ids[0])
@@ -314,7 +326,7 @@ def main():
             print("[警告] CUDA 不可用，已退回 CPU 训练。")
 
     # ── 2. 日志 & TensorBoard ──────────────────────────────────
-    logger    = get_logger("iceberg", log_dir=cfg.paths.log_dir)
+    logger    = get_logger("iceberg", log_dir=cfg.paths.log_dir, run_id=run_id)
     tb_writer = get_tb_writer(cfg.paths.log_dir) if cfg.train.logging.use_tensorboard else None
     wandb_run = get_wandb_run(cfg)
 
@@ -439,6 +451,16 @@ def main():
             )
         else:
             es_counter += 1
+
+        # ── 每 epoch 覆盖写入 last_model.pth（供断点续训）──
+        save_last_checkpoint(
+            cfg=cfg,
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            scheduler=_sched_for_ckpt,
+            best_metric=best_metric,
+        )
 
         # ── 本 epoch 耗时 ──
         elapsed = time.time() - epoch_start

@@ -79,6 +79,34 @@ def save_checkpoint(
     return best_path
 
 
+def save_last_checkpoint(
+    cfg,
+    epoch: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    best_metric: float,
+) -> Path:
+    """每个 epoch 结束后覆盖写入 last_model.pth，用于断点续训。"""
+    ckpt_dir = Path(cfg.paths.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    model_state = (
+        model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+    )
+    state = {
+        "epoch":           epoch,
+        "model_state":     model_state,
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "best_metric":     best_metric,
+        "cfg_yaml":        OmegaConf.to_yaml(cfg),
+    }
+    last_path = ckpt_dir / "last_model.pth"
+    torch.save(state, last_path)
+    return last_path
+
+
 # ──────────────────────────────────────────────────────────────────
 # 加载
 # ──────────────────────────────────────────────────────────────────

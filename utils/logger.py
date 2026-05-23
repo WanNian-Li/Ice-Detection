@@ -31,6 +31,7 @@ def get_logger(
     name: str = "iceberg",
     log_dir: Optional[str] = None,
     level: int = logging.INFO,
+    run_id: Optional[str] = None,
 ) -> logging.Logger:
     """
     获取配置好的 Logger 实例。
@@ -82,7 +83,7 @@ def get_logger(
     if log_dir is not None:
         log_dir = Path(log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = run_id if run_id else datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file = log_dir / f"train_{timestamp}.log"
 
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
