@@ -1,0 +1,27 @@
+# ============================================================
+#  实验配置：Focal Loss 替换 ROI Head 分类损失
+#  继承自 config.yaml，仅覆盖差异项
+#
+#  动机：三组实验中 precision↑/recall↓ 趋势是类别极度不平衡的典型症状。
+#        Focal Loss (γ=2) 通过下调易分背景梯度权重，迫使模型关注冰山难例，
+#        从根本上恢复 recall，而不是靠推理阈值打补丁。
+#
+#  运行方式：
+#    python train.py --config configs/config_exp_focal_loss.yaml
+# ============================================================
+
+_base_: "config.yaml"
+
+model:
+  mask_rcnn:
+    focal_loss:
+      enabled: true
+      gamma: 2.0        # 标准 Focal Loss γ；越大对易分样本的惩罚越重
+
+paths:
+  checkpoint_dir: "outputs/checkpoints/exp_focal_loss"
+  log_dir:        "outputs/logs/exp_focal_loss"
+
+train:
+  logging:
+    wandb_run_name: "exp_focal_loss"

@@ -1,0 +1,26 @@
+# ============================================================
+#  实验配置：多尺度训练（Multi-Scale Training）
+#  继承自 config.yaml，仅覆盖差异项
+#
+#  动机：冰山尺寸从 5px 到数百 px 跨越两个数量级，固定 512 训练对极小/
+#        跨 patch 边界目标泛化差。torchvision MaskRCNN 的 GeneralizedRCNN
+#        当 min_size 为 tuple 时，每 batch 随机采样一个尺度，无需改模型结构。
+#
+#  运行方式：
+#    python train.py --config configs/config_exp_multiscale.yaml
+# ============================================================
+
+_base_: "config.yaml"
+
+model:
+  mask_rcnn:
+    min_size: [384, 448, 512, 576, 640]   # 每 batch 随机采样，覆盖不同尺度目标
+    max_size: 640                          # 与最大 min_size 对齐，避免过度缩放
+
+paths:
+  checkpoint_dir: "outputs/checkpoints/exp_multiscale"
+  log_dir:        "outputs/logs/exp_multiscale"
+
+train:
+  logging:
+    wandb_run_name: "exp_multiscale"

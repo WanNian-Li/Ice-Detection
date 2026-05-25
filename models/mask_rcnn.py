@@ -14,6 +14,8 @@ from collections import OrderedDict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from omegaconf import ListConfig
 from torchvision.models.detection import MaskRCNN, maskrcnn_resnet50_fpn
 from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
@@ -26,6 +28,42 @@ try:
     _TIMM_AVAILABLE = True
 except ImportError:
     _TIMM_AVAILABLE = False
+
+
+# ──────────────────────────────────────────────────────────────────
+# Focal Loss（替换 ROI Head 分类 CE Loss）
+# ──────────────────────────────────────────────────────────────────
+
+def _make_focal_fastrcnn_loss(gamma: float = 2.0):
+    """
+    返回一个与 torchvision fastrcnn_loss 签名相同的 Focal Loss 版本。
+    仅替换分类损失（CE → Focal）；box regression 保持 smooth_l1 不变。
+    通过 monkey-patch torchvision.models.detection.roi_heads.fastrcnn_loss 生效。
+    """
+    def focal_fastrcnn_loss(class_logits, box_regression, labels, regression_targets):
+        labels_cat = torch.cat(labels, dim=0)
+        regression_targets_cat = torch.cat(regression_targets, dim=0)
+
+        # Focal Loss for classification: down-weight easy negatives
+        ce = F.cross_entropy(class_logits, labels_cat, reduction="none")
+        p_t = torch.exp(-ce)
+        loss_classifier = ((1 - p_t) ** gamma * ce).mean()
+
+        # Box regression loss (unchanged from torchvision)
+        pos_inds = torch.where(labels_cat > 0)[0]
+        labels_pos = labels_cat[pos_inds]
+        N = class_logits.shape[0]
+        box_regression = box_regression.reshape(N, box_regression.shape[-1] // 4, 4)
+        loss_box_reg = F.smooth_l1_loss(
+            box_regression[pos_inds, labels_pos],
+            regression_targets_cat[pos_inds],
+            beta=1 / 9,
+            reduction="sum",
+        ) / labels_cat.numel()
+
+        return loss_classifier, loss_box_reg
+
+    return focal_fastrcnn_loss
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -105,13 +143,22 @@ def build_mask_rcnn(cfg) -> MaskRCNN:
     backbone_name = str(mc.get("backbone", "resnet50"))
     pretrained    = bool(mc.pretrained_backbone)
 
+    # ── min_size：支持单值（固定尺度）或列表（多尺度随机采样）──
+    min_size_cfg = mc.min_size
+    if isinstance(min_size_cfg, (list, ListConfig)):
+        min_size = tuple(int(s) for s in min_size_cfg)
+        print(f"[Model] 多尺度训练: min_size={list(min_size)}  max_size={int(mc.max_size)}")
+    else:
+        min_size = int(min_size_cfg)
+    max_size = int(mc.max_size)
+
     if backbone_name == "resnet50":
         # ── 路径 A：torchvision 内置 ResNet50 + FPN ──
         model = maskrcnn_resnet50_fpn(
             weights=None,
             weights_backbone="DEFAULT" if pretrained else None,
-            min_size=int(mc.min_size),
-            max_size=int(mc.max_size),
+            min_size=min_size,
+            max_size=max_size,
             rpn_anchor_generator=anchor_generator,
             rpn_nms_thresh=float(mc.rpn_nms_thresh),
             rpn_fg_iou_thresh=float(mc.rpn_fg_iou_thresh),
@@ -142,8 +189,8 @@ def build_mask_rcnn(cfg) -> MaskRCNN:
         model = MaskRCNN(
             backbone=backbone,
             num_classes=num_classes,
-            min_size=int(mc.min_size),
-            max_size=int(mc.max_size),
+            min_size=min_size,
+            max_size=max_size,
             rpn_anchor_generator=anchor_generator,
             rpn_nms_thresh=float(mc.rpn_nms_thresh),
             rpn_fg_iou_thresh=float(mc.rpn_fg_iou_thresh),
@@ -181,6 +228,14 @@ def build_mask_rcnn(cfg) -> MaskRCNN:
     if mc.pretrained_weights is not None:
         state = torch.load(mc.pretrained_weights, map_location="cpu", weights_only=False)
         model.load_state_dict(state.get("model_state", state), strict=False)
+
+    # ── Focal Loss（可选）：monkey-patch torchvision roi_heads 模块级函数 ──
+    focal_cfg = mc.get("focal_loss", None)
+    if focal_cfg is not None and focal_cfg.get("enabled", False):
+        gamma = float(focal_cfg.get("gamma", 2.0))
+        import torchvision.models.detection.roi_heads as _rh_mod
+        _rh_mod.fastrcnn_loss = _make_focal_fastrcnn_loss(gamma)
+        print(f"[Model] Focal Loss enabled  (gamma={gamma})")
 
     return model
 

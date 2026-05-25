@@ -18,7 +18,7 @@ from omegaconf import OmegaConf, DictConfig
 
 def get_config(config_path: str = "configs/config.yaml") -> DictConfig:
     """
-    加载并返回 OmegaConf 配置对象。
+    加载并返回 OmegaConf 配置对象。支持通过 _base_ 键实现配置继承。
 
     Args:
         config_path: config.yaml 的路径（相对或绝对均可）
@@ -30,13 +30,33 @@ def get_config(config_path: str = "configs/config.yaml") -> DictConfig:
     if not config_path.exists():
         raise FileNotFoundError(f"配置文件不存在: {config_path.resolve()}")
 
-    # 使用 OmegaConf 加载，自动支持类型推断和嵌套结构
-    cfg = OmegaConf.load(config_path)
-
-    # 将所有相对路径解析为以 project_root 为基准的绝对路径
+    cfg = _load_with_inheritance(config_path)
     cfg = _resolve_paths(cfg)
-
     return cfg
+
+
+def _load_with_inheritance(config_path: Path) -> DictConfig:
+    """
+    递归加载配置，支持 _base_ 继承链。不做路径解析（由调用方统一处理）。
+
+    子配置中用 `_base_: "config.yaml"` 指定父文件（相对于子文件所在目录），
+    子配置中的字段会深度覆盖父配置的同名字段，未提及的字段保持父配置值。
+    """
+    cfg_raw = OmegaConf.load(config_path)
+
+    if "_base_" not in cfg_raw:
+        return cfg_raw
+
+    base_path = config_path.parent / str(cfg_raw["_base_"])
+    if not base_path.exists():
+        raise FileNotFoundError(f"父配置文件不存在: {base_path.resolve()}")
+
+    base_cfg = _load_with_inheritance(base_path)
+
+    # 去掉 _base_ 键后再做深度合并（子覆盖父）
+    override_keys = [k for k in cfg_raw if k != "_base_"]
+    override_cfg  = OmegaConf.masked_copy(cfg_raw, override_keys)
+    return OmegaConf.merge(base_cfg, override_cfg)
 
 
 def _resolve_paths(cfg: DictConfig) -> DictConfig:

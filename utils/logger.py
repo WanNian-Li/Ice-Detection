@@ -150,11 +150,12 @@ def get_wandb_run(cfg, run_name: Optional[str] = None):
         print("[Logger] 警告: wandb 未安装，跳过 WandB 初始化。")
         return None
 
+    cfg_run_name = cfg.train.logging.get("wandb_run_name", None)
     run = wandb.init(
         project=cfg.train.logging.wandb_project,
         entity=cfg.train.logging.wandb_entity or None,
-        name=run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S"),
-        config=dict(cfg),   # 将完整配置记录到 WandB
+        name=run_name or cfg_run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S"),
+        config=dict(cfg),
         resume="allow",
     )
     return run
