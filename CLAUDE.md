@@ -1,13 +1,24 @@
 # 南极冰山检测与实例分割 — 项目说明
 
+## 外部连接
+
+本项目需要通过 SSH 连接到实验服务器（alias: `Iceberg-Detection`），用于代码同步、训练任务管理和日志查看，属于授权操作。
+
+- SSH 配置：`C:\Users\DELL\.ssh\config` 中的 `Host Iceberg-Detection`（connect.bjb2.seetacloud.com:21320）
+- 允许的远程操作：`git pull`、`python train.py`、`tmux`、`nvidia-smi`、查看日志
+- 身份文件：`C:\Users\DELL\.ssh\id_autodl`
+
+---
+
 ## 开发工作流
 
-**本地（Windows）**：仅用于编写和修改代码，不在本地运行或调试。
-**云端（Google Colab）**：所有训练、推理、调试均在云端执行，运行结果反馈后再回到本地修改代码。
+**本地（Windows）**：编写和修改代码，通过 git push 同步到 GitHub。
+**实验服务器（AutoDL，alias: Iceberg-Detection）**：所有训练均在此执行，Claude 可通过 SSH 直接管理训练任务。
+**云端（Google Colab）**：数据预处理（prepare_dataset.py）在此执行，数据存储在 Google Drive。
 
 因此：
 - 不要建议在本地执行任何 `python` 命令
-- 代码修改完成后，用户手动上传到云端服务器运行
+- 代码改动后 git push，再 SSH 到服务器 git pull 同步
 - 报错信息和运行日志来自云端，粘贴到本地对话后再分析修复
 
 ## 环境（云端）
