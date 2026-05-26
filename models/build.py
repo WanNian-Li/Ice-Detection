@@ -8,6 +8,7 @@ models/build.py
     model = build_model(cfg)
 """
 
+import torch
 import torch.nn as nn
 
 from models.mask_rcnn import build_mask_rcnn, get_mask_rcnn_params
@@ -52,6 +53,11 @@ def build_model(cfg) -> nn.Module:
         f"[Model] 架构: {arch}  |  "
         f"可训练参数: {n_params / 1e6:.2f} M"
     )
+
+    if cfg.get("compile_model", False) and hasattr(torch, "compile"):
+        model = torch.compile(model)
+        print("[Model] torch.compile 已启用")
+
     return model
 
 
