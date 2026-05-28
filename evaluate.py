@@ -53,6 +53,85 @@ logger = get_logger("iceberg.evaluate")
 
 
 # ══════════════════════════════════════════════════════════════════
+# 后处理过滤：去除冰川 / 冰架误报
+# ══════════════════════════════════════════════════════════════════
+
+def filter_predictions_postprocess(
+    preds:              List[Dict],
+    max_area_px:        int   = 0,
+    border_touch_area:  int   = 0,
+) -> Tuple[List[Dict], Dict[str, int]]:
+    """
+    对推理结果进行后处理过滤，抑制冰川/冰架误报。
+
+    两种互补启发式规则（无需外部地理数据）：
+      1. 尺寸过滤 (max_area_px > 0)
+             掩膜像素数 > max_area_px 的预测直接丢弃。
+             依据：冰山有典型物理上限；冰架/冰川连片区域面积远超最大冰山。
+             推荐初始值：50000 px（对应约 89km² @ 40m 分辨率）。
+      2. 边缘连通过滤 (border_touch_area > 0)
+             掩膜同时满足"触碰图像边缘"且"面积 > border_touch_area"时丢弃。
+             依据：冰架通常从图像边缘延伸进 patch；孤立冰山即使碰边缘面积也小。
+             推荐初始值：10000 px。
+
+    Args:
+        preds:             推理输出列表，每个元素含 masks(N,1,H,W) / scores(N,) / boxes(N,4)
+        max_area_px:       尺寸过滤阈值（像素数），0 = 禁用
+        border_touch_area: 边缘连通过滤面积下限（像素数），0 = 禁用
+
+    Returns:
+        (filtered_preds, stats)
+        stats 包含 total_before / total_after / removed_area / removed_border
+    """
+    stats = {"total_before": 0, "total_after": 0, "removed_area": 0, "removed_border": 0}
+    filtered = []
+
+    for pred in preds:
+        masks  = pred["masks"]   # (N, 1, H, W) float32
+        scores = pred["scores"]  # (N,)
+        boxes  = pred.get("boxes", torch.zeros(len(scores), 4))
+
+        n = len(scores)
+        stats["total_before"] += n
+
+        if n == 0:
+            filtered.append(pred)
+            continue
+
+        bin_masks = masks[:, 0] > 0.5          # (N, H, W) bool
+        areas     = bin_masks.float().sum(dim=(-2, -1))  # (N,) 每个实例的掩膜面积
+
+        keep = torch.ones(n, dtype=torch.bool)
+
+        # ── 尺寸过滤 ──
+        if max_area_px > 0:
+            too_large = areas > max_area_px
+            stats["removed_area"] += int(too_large.sum())
+            keep &= ~too_large
+
+        # ── 边缘连通过滤 ──
+        if border_touch_area > 0:
+            top    = bin_masks[:, 0, :].any(dim=1)
+            bottom = bin_masks[:, -1, :].any(dim=1)
+            left   = bin_masks[:, :, 0].any(dim=1)
+            right  = bin_masks[:, :, -1].any(dim=1)
+            touches = top | bottom | left | right
+            border_large = touches & (areas > border_touch_area)
+            stats["removed_border"] += int(border_large.sum())
+            keep &= ~border_large
+
+        idx = keep.nonzero(as_tuple=True)[0]
+        stats["total_after"] += len(idx)
+        filtered.append({
+            "masks":  masks[idx],
+            "scores": scores[idx],
+            "boxes":  boxes[idx],
+        })
+
+    return filtered, stats
+
+
+# ══════════════════════════════════════════════════════════════════
 # AP 计算（COCO 101 点插值）
 # ══════════════════════════════════════════════════════════════════
 
@@ -300,15 +379,23 @@ def visualize_predictions(
 @torch.no_grad()
 def evaluate(
     cfg,
-    split:           str = "test",
-    checkpoint_path: Optional[str] = None,
-    visualize:       bool = True,
+    split:              str = "test",
+    checkpoint_path:    Optional[str] = None,
+    visualize:          bool = True,
+    max_area_px:        int  = 0,
+    border_touch_area:  int  = 0,
+    compare:            bool = False,
 ) -> Dict[str, float]:
     """
     在指定分割数据集上全量评估模型。
 
+    Args:
+        max_area_px:       尺寸过滤阈值（像素数）。>0 时启用，推荐 50000。
+        border_touch_area: 边缘连通过滤面积下限。>0 时启用，推荐 10000。
+        compare:           True 时同时打印过滤前/后的指标对比表格。
+
     Returns:
-        指标字典，同时打印到控制台并保存为 CSV。
+        指标字典（过滤后），同时打印到控制台并保存为 CSV。
     """
     arch = cfg.model.architecture
 
@@ -367,6 +454,26 @@ def evaluate(
             all_preds.extend([pred_masks[i] for i in range(len(pred_masks))])
             all_targets.extend([masks[i] for i in range(len(masks))])
 
+    # ── 后处理过滤（可选） ──
+    filter_enabled = (max_area_px > 0 or border_touch_area > 0)
+    preds_raw = all_preds   # 保留原始预测供对比
+
+    if arch == "mask_rcnn" and filter_enabled:
+        all_preds_filtered, fstats = filter_predictions_postprocess(
+            all_preds,
+            max_area_px=max_area_px,
+            border_touch_area=border_touch_area,
+        )
+        removed = fstats["total_before"] - fstats["total_after"]
+        logger.info(
+            f"后处理过滤: 共 {fstats['total_before']} 个预测框 → "
+            f"{fstats['total_after']} 个 "
+            f"(移除 {removed}: "
+            f"尺寸过大={fstats['removed_area']}, "
+            f"边缘连通={fstats['removed_border']})"
+        )
+        all_preds = all_preds_filtered
+
     # ── 计算指标 ──
     logger.info("计算评估指标 ...")
     iou_thresholds = [float(t) for t in cfg.evaluate.iou_thresholds]
@@ -413,18 +520,49 @@ def evaluate(
         metrics = compute_unet_metrics(preds_cat, targets_cat, num_classes)
 
     # ── 打印结果 ──
-    _print_metrics_table(metrics, split, arch)
+    label = "过滤后" if filter_enabled else "原始"
+    _print_metrics_table(metrics, split, arch, label=label)
+
+    # ── compare 模式：额外计算并对比过滤前的指标 ──
+    if compare and arch == "mask_rcnn" and filter_enabled:
+        logger.info("── 计算过滤前（原始）指标以供对比 ──")
+        metrics_raw: Dict[str, float] = {}
+        for t in iou_thresholds:
+            ap, prec, rec, f1 = compute_ap_at_iou(
+                preds_raw, all_targets, iou_thresh=t, score_thresh=score_thresh,
+            )
+            metrics_raw[f"AP@{t:.2f}"] = ap
+            metrics_raw[f"P@{t:.2f}"]  = prec
+            metrics_raw[f"R@{t:.2f}"]  = rec
+            metrics_raw[f"F1@{t:.2f}"] = f1
+
+        ap_coco_raw = []
+        for t in np.arange(0.50, 1.00, 0.05):
+            ap_t, _, _, _ = compute_ap_at_iou(
+                preds_raw, all_targets, iou_thresh=round(float(t), 2),
+                score_thresh=score_thresh,
+            )
+            ap_coco_raw.append(ap_t)
+        metrics_raw["mAP[0.50:0.95]"] = float(np.mean(ap_coco_raw))
+
+        from utils.metrics import compute_instance_metrics as _cim
+        metrics_raw.update(_cim(preds_raw, all_targets,
+                                iou_thresh=iou_thresholds[0],
+                                score_thresh=score_thresh))
+
+        _print_compare_table(metrics_raw, metrics, split)
 
     # ── 保存 CSV ──
     out_dir  = Path(cfg.paths.prediction_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / f"eval_{split}_{arch}.csv"
+    suffix   = "_filtered" if filter_enabled else ""
+    csv_path = out_dir / f"eval_{split}_{arch}{suffix}.csv"
     pd.DataFrame([metrics]).to_csv(csv_path, index=False, float_format="%.4f")
     logger.info(f"指标 CSV 已保存: {csv_path}")
 
     # ── 可视化样本 ──
     if visualize and len(all_images) > 0:
-        vis_path = out_dir / f"eval_{split}_{arch}_samples.png"
+        vis_path = out_dir / f"eval_{split}_{arch}{suffix}_samples.png"
         visualize_predictions(
             all_images, all_preds, all_targets,
             arch=arch, output_path=vis_path, n_samples=8,
@@ -433,13 +571,17 @@ def evaluate(
     return metrics
 
 
-def _print_metrics_table(metrics: Dict[str, float], split: str, arch: str):
+def _print_metrics_table(
+    metrics: Dict[str, float],
+    split:   str,
+    arch:    str,
+    label:   str = "原始",
+):
     """格式化打印指标表格。"""
     logger.info("=" * 55)
-    logger.info(f"评估结果  split={split}  arch={arch}")
+    logger.info(f"评估结果 [{label}]  split={split}  arch={arch}")
     logger.info("=" * 55)
 
-    # 按优先级排序展示
     priority_keys = [
         "mAP[0.50:0.95]", "AP@0.50", "AP@0.75",
         "P@0.50", "R@0.50", "F1@0.50",
@@ -457,6 +599,30 @@ def _print_metrics_table(metrics: Dict[str, float], split: str, arch: str):
     logger.info("=" * 55)
 
 
+def _print_compare_table(
+    raw:      Dict[str, float],
+    filtered: Dict[str, float],
+    split:    str,
+):
+    """并排打印过滤前/后的关键指标对比。"""
+    keys = ["AP@0.50", "AP@0.75", "mAP[0.50:0.95]",
+            "P@0.50", "R@0.50", "F1@0.50",
+            "val_ap50", "val_precision", "val_recall", "val_f1"]
+    keys = [k for k in keys if k in raw or k in filtered]
+
+    logger.info("=" * 65)
+    logger.info(f"过滤前后对比  split={split}")
+    logger.info(f"  {'指标':<25s}  {'原始':>8s}  {'过滤后':>8s}  {'变化':>8s}")
+    logger.info("-" * 65)
+    for k in keys:
+        v_raw = raw.get(k, float("nan"))
+        v_fil = filtered.get(k, float("nan"))
+        delta = v_fil - v_raw
+        sign  = "+" if delta >= 0 else ""
+        logger.info(f"  {k:<25s}  {v_raw:>8.4f}  {v_fil:>8.4f}  {sign}{delta:>7.4f}")
+    logger.info("=" * 65)
+
+
 # ══════════════════════════════════════════════════════════════════
 # CLI 入口
 # ══════════════════════════════════════════════════════════════════
@@ -470,6 +636,22 @@ def parse_args():
                         choices=["train", "val", "test"])
     parser.add_argument("--no_vis",     action="store_true",
                         help="跳过可视化（节省内存）")
+
+    # ── 后处理过滤（冰川/冰架抑制） ──
+    filter_grp = parser.add_argument_group("后处理过滤")
+    filter_grp.add_argument(
+        "--max_area_px", type=int, default=0,
+        help="尺寸过滤：掩膜像素数超过此值时丢弃（0=禁用）。推荐起始值：50000"
+    )
+    filter_grp.add_argument(
+        "--border_touch_area", type=int, default=0,
+        help="边缘连通过滤：触碰图像边缘且面积超过此值时丢弃（0=禁用）。推荐起始值：10000"
+    )
+    filter_grp.add_argument(
+        "--compare", action="store_true",
+        help="同时输出过滤前后的指标对比表格"
+    )
+
     return parser.parse_args()
 
 
@@ -483,6 +665,9 @@ def main():
         split=args.split,
         checkpoint_path=args.checkpoint,
         visualize=not args.no_vis,
+        max_area_px=args.max_area_px,
+        border_touch_area=args.border_touch_area,
+        compare=args.compare,
     )
 
 
