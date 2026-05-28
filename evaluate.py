@@ -25,11 +25,13 @@ evaluate.py
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import h5py
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -128,6 +130,241 @@ def filter_predictions_postprocess(
             "boxes":  boxes[idx],
         })
 
+    return filtered, stats
+
+
+# ══════════════════════════════════════════════════════════════════
+# 地理边界过滤：利用 MEaSUREs 南极边界去除冰架 / 冰川误报
+# ══════════════════════════════════════════════════════════════════
+
+def load_geo_resources(
+    scene_meta_path: str,
+    boundary_shp_path: str,
+) -> Tuple[Dict, Any]:
+    """
+    加载场景地理元数据 JSON 和南极边界多边形。
+
+    Args:
+        scene_meta_path:   export_scene_meta.py 生成的 JSON 文件路径
+        boundary_shp_path: MEaSUREs / ADD 南极海岸线 shapefile 路径
+                           （包含大陆 + 冰架区域的多边形）
+
+    Returns:
+        (scene_meta dict, boundary_geom shapely geometry)
+    """
+    try:
+        import geopandas as gpd
+        from shapely.ops import unary_union
+    except ImportError:
+        raise ImportError(
+            "地理边界过滤需要 geopandas 和 shapely。\n"
+            "  pip install geopandas shapely"
+        )
+
+    with open(scene_meta_path, "r", encoding="utf-8") as f:
+        scene_meta = json.load(f)
+    logger.info(f"已加载场景元数据: {len(scene_meta)} 个场景  ({scene_meta_path})")
+
+    gdf = gpd.read_file(boundary_shp_path)
+    gdf = gdf.to_crs(epsg=3031)
+    boundary_geom = unary_union(gdf.geometry)
+    logger.info(f"已加载南极边界多边形  ({boundary_shp_path})")
+
+    return scene_meta, boundary_geom
+
+
+def load_h5_spatial_meta(h5_path: str) -> Tuple[List[str], np.ndarray, np.ndarray]:
+    """
+    从 HDF5 文件读取空间位置元数据（scene / row / col），不加载图像数据。
+
+    Returns:
+        (scenes, rows, cols)
+        scenes: List[str]，长度 N
+        rows:   np.ndarray int32，形状 (N,)
+        cols:   np.ndarray int32，形状 (N,)
+    """
+    with h5py.File(h5_path, "r") as f:
+        raw_scenes = f["scene"][:]
+        rows = f["row"][:]
+        cols = f["col"][:]
+
+    # h5py 返回 bytes，统一解码为 str
+    scenes = [
+        s.decode("utf-8") if isinstance(s, bytes) else str(s)
+        for s in raw_scenes
+    ]
+    return scenes, rows.astype(np.int32), cols.astype(np.int32)
+
+
+def _get_patch_land_mask(
+    scene_name:  str,
+    row_offset:  int,
+    col_offset:  int,
+    patch_size:  int,
+    scene_meta:  Dict,
+    boundary_geom,
+    _cache:      Dict,
+) -> Optional[np.ndarray]:
+    """
+    将南极边界多边形栅格化到当前 patch 的像素坐标系，
+    返回 (H, W) bool 数组（True = 陆地/冰架）。
+
+    结果按 (scene_name, row_offset, col_offset) 缓存，
+    避免对同一 patch 重复栅格化。
+
+    Returns:
+        None  — patch 与边界无交叠，无需过滤
+        array — 交叠区域的像素级掩膜
+    """
+    cache_key = (scene_name, row_offset, col_offset)
+    if cache_key in _cache:
+        return _cache[cache_key]
+
+    meta = scene_meta.get(scene_name)
+    if meta is None:
+        _cache[cache_key] = None
+        return None
+
+    try:
+        from rasterio.features import rasterize as rio_rasterize
+        from rasterio.transform import from_origin
+        from shapely.geometry import box, mapping
+    except ImportError:
+        raise ImportError("需要 rasterio 和 shapely：pip install rasterio shapely")
+
+    ox    = meta["origin_x"]
+    oy    = meta["origin_y"]
+    res_x = meta["res_x"]    # > 0
+    res_y = meta["res_y"]    # < 0
+
+    # patch 地理范围（EPSG:3031，单位：米）
+    left   = ox + col_offset * res_x
+    top    = oy + row_offset * res_y
+    right  = left + patch_size * res_x
+    bottom = top  + patch_size * res_y   # bottom < top（res_y < 0）
+
+    patch_box = box(left, bottom, right, top)
+
+    if not boundary_geom.intersects(patch_box):
+        _cache[cache_key] = None
+        return None
+
+    intersection = boundary_geom.intersection(patch_box)
+    if intersection.is_empty:
+        _cache[cache_key] = None
+        return None
+
+    patch_transform = from_origin(left, top, abs(res_x), abs(res_y))
+    land = rio_rasterize(
+        [(mapping(intersection), 1)],
+        out_shape=(patch_size, patch_size),
+        transform=patch_transform,
+        fill=0,
+        dtype=np.uint8,
+        all_touched=False,
+    ).astype(bool)
+
+    _cache[cache_key] = land
+    return land
+
+
+def filter_predictions_geographic(
+    preds:          List[Dict],
+    targets:        List[Dict],
+    h5_scenes:      List[str],
+    h5_rows:        np.ndarray,
+    h5_cols:        np.ndarray,
+    scene_meta:     Dict,
+    boundary_geom,
+    patch_size:     int   = 512,
+    overlap_thresh: float = 0.5,
+) -> Tuple[List[Dict], Dict[str, int]]:
+    """
+    利用 MEaSUREs 南极边界对预测结果做地理位置过滤。
+
+    对每个预测掩膜，计算其与陆地/冰架像素的重叠比例；
+    重叠比例 > overlap_thresh 时丢弃该预测（视为冰架/冰川误报）。
+
+    Args:
+        preds:          推理预测列表（masks/scores/boxes）
+        targets:        真值列表（用于获取 image_id → HDF5 索引）
+        h5_scenes:      HDF5 全量 scene 数组（由 load_h5_spatial_meta 加载）
+        h5_rows:        HDF5 全量 row 数组
+        h5_cols:        HDF5 全量 col 数组
+        scene_meta:     export_scene_meta.py 生成的场景地理元数据字典
+        boundary_geom:  南极边界 shapely 多边形（已投影到 EPSG:3031）
+        patch_size:     切片大小（像素），与 HDF5 存储一致
+        overlap_thresh: 重叠比例阈值，超过此值则丢弃（默认 0.5）
+
+    Returns:
+        (filtered_preds, stats)
+    """
+    stats = {
+        "total_before":   0,
+        "total_after":    0,
+        "removed_geo":    0,
+        "patches_checked": 0,
+        "missing_meta":   0,
+    }
+    _land_mask_cache: Dict = {}
+    filtered = []
+
+    for pred, target in zip(preds, targets):
+        image_id = int(target["image_id"].item())
+
+        masks  = pred["masks"]   # (N, 1, H, W)
+        scores = pred["scores"]
+        boxes  = pred.get("boxes", torch.zeros(len(scores), 4))
+        n = len(scores)
+        stats["total_before"] += n
+
+        if n == 0 or image_id >= len(h5_scenes):
+            filtered.append(pred)
+            stats["total_after"] += n
+            continue
+
+        scene_name = h5_scenes[image_id]
+        row_offset  = int(h5_rows[image_id])
+        col_offset  = int(h5_cols[image_id])
+
+        land_mask = _get_patch_land_mask(
+            scene_name, row_offset, col_offset,
+            patch_size, scene_meta, boundary_geom,
+            _land_mask_cache,
+        )
+
+        if land_mask is None:
+            # patch 完全在开阔水域，无需过滤
+            filtered.append(pred)
+            stats["total_after"] += n
+            continue
+
+        stats["patches_checked"] += 1
+        land_t   = torch.from_numpy(land_mask)   # (H, W) bool
+        bin_masks = masks[:, 0] > 0.5            # (N, H, W) bool
+
+        # 向量化：计算每个预测掩膜与 land_mask 的重叠比例
+        # overlap[i] = (bin_masks[i] & land_t).sum() / bin_masks[i].sum()
+        pred_area = bin_masks.float().sum(dim=(-2, -1)).clamp(min=1)   # (N,)
+        overlap   = (bin_masks & land_t.unsqueeze(0)).float().sum(dim=(-2, -1))  # (N,)
+        land_frac = overlap / pred_area                                 # (N,)
+
+        keep = land_frac <= overlap_thresh
+        removed = int((~keep).sum())
+        stats["removed_geo"]  += removed
+        stats["total_after"]  += n - removed
+
+        idx = keep.nonzero(as_tuple=True)[0]
+        filtered.append({
+            "masks":  masks[idx],
+            "scores": scores[idx],
+            "boxes":  boxes[idx],
+        })
+
+    logger.info(
+        f"地理边界过滤: 检查了 {stats['patches_checked']} 个与边界相交的 patch，"
+        f"移除 {stats['removed_geo']} 个预测（冰架/冰川区域）"
+    )
     return filtered, stats
 
 
@@ -379,20 +616,32 @@ def visualize_predictions(
 @torch.no_grad()
 def evaluate(
     cfg,
-    split:              str = "test",
+    split:              str  = "test",
     checkpoint_path:    Optional[str] = None,
     visualize:          bool = True,
+    # ── 启发式后处理过滤 ──
     max_area_px:        int  = 0,
     border_touch_area:  int  = 0,
+    # ── 地理边界过滤 ──
+    scene_meta_path:    Optional[str] = None,
+    boundary_shp_path:  Optional[str] = None,
+    geo_overlap_thresh: float = 0.5,
+    # ── 对比模式 ──
     compare:            bool = False,
 ) -> Dict[str, float]:
     """
     在指定分割数据集上全量评估模型。
 
-    Args:
-        max_area_px:       尺寸过滤阈值（像素数）。>0 时启用，推荐 50000。
-        border_touch_area: 边缘连通过滤面积下限。>0 时启用，推荐 10000。
-        compare:           True 时同时打印过滤前/后的指标对比表格。
+    启发式过滤（无需外部数据）：
+        max_area_px:        掩膜像素数 > 阈值时丢弃（推荐 50000）
+        border_touch_area:  触碰边缘且面积 > 阈值时丢弃（推荐 10000）
+
+    地理边界过滤（精确，需要外部数据）：
+        scene_meta_path:    export_scene_meta.py 生成的 JSON
+        boundary_shp_path:  MEaSUREs / ADD 南极边界 shapefile
+        geo_overlap_thresh: 预测掩膜与陆地重叠比例 > 阈值则丢弃（默认 0.5）
+
+    compare:  True 时同时打印过滤前/后的指标对比表格。
 
     Returns:
         指标字典（过滤后），同时打印到控制台并保存为 CSV。
@@ -423,6 +672,24 @@ def evaluate(
 
     num_classes = int(cfg.dataset.num_classes)
     use_amp     = cfg.train.amp and device.type == "cuda"
+
+    # ── 地理边界资源加载（可选） ──
+    geo_filter_enabled = (
+        arch == "mask_rcnn"
+        and scene_meta_path is not None
+        and boundary_shp_path is not None
+    )
+    h5_scenes = h5_rows = h5_cols = None
+    scene_meta = boundary_geom = None
+
+    if geo_filter_enabled:
+        logger.info("加载地理边界过滤资源 ...")
+        scene_meta, boundary_geom = load_geo_resources(
+            scene_meta_path, boundary_shp_path
+        )
+        h5_path = str(Path(cfg.paths.hdf5_dir) / f"{split}.h5")
+        h5_scenes, h5_rows, h5_cols = load_h5_spatial_meta(h5_path)
+        logger.info(f"已加载 HDF5 空间元数据: {len(h5_scenes)} 个样本")
 
     # ── 推理 ──
     all_images   = []
@@ -455,10 +722,11 @@ def evaluate(
             all_targets.extend([masks[i] for i in range(len(masks))])
 
     # ── 后处理过滤（可选） ──
-    filter_enabled = (max_area_px > 0 or border_touch_area > 0)
+    heuristic_enabled = (max_area_px > 0 or border_touch_area > 0)
+    filter_enabled    = heuristic_enabled or geo_filter_enabled
     preds_raw = all_preds   # 保留原始预测供对比
 
-    if arch == "mask_rcnn" and filter_enabled:
+    if arch == "mask_rcnn" and heuristic_enabled:
         all_preds_filtered, fstats = filter_predictions_postprocess(
             all_preds,
             max_area_px=max_area_px,
@@ -466,13 +734,27 @@ def evaluate(
         )
         removed = fstats["total_before"] - fstats["total_after"]
         logger.info(
-            f"后处理过滤: 共 {fstats['total_before']} 个预测框 → "
+            f"启发式过滤: 共 {fstats['total_before']} 个预测框 → "
             f"{fstats['total_after']} 个 "
             f"(移除 {removed}: "
             f"尺寸过大={fstats['removed_area']}, "
             f"边缘连通={fstats['removed_border']})"
         )
         all_preds = all_preds_filtered
+
+    if geo_filter_enabled:
+        patch_size = int(cfg.data_prep.patch_size)
+        all_preds, gstats = filter_predictions_geographic(
+            all_preds, all_targets,
+            h5_scenes, h5_rows, h5_cols,
+            scene_meta, boundary_geom,
+            patch_size=patch_size,
+            overlap_thresh=geo_overlap_thresh,
+        )
+        logger.info(
+            f"地理边界过滤后: {gstats['total_before']} → {gstats['total_after']} 个 "
+            f"(移除 {gstats['removed_geo']})"
+        )
 
     # ── 计算指标 ──
     logger.info("计算评估指标 ...")
@@ -652,6 +934,24 @@ def parse_args():
         help="同时输出过滤前后的指标对比表格"
     )
 
+    geo_grp = parser.add_argument_group("地理边界过滤（精确方法，需要外部数据）")
+    geo_grp.add_argument(
+        "--scene_meta", type=str, default=None,
+        help="data_prep/export_scene_meta.py 生成的 JSON 路径（如 data/scene_meta.json）"
+    )
+    geo_grp.add_argument(
+        "--boundary_shp", type=str, default=None,
+        help=(
+            "南极边界 shapefile 路径（MEaSUREs NSIDC-0709 或 ADD）。\n"
+            "需包含大陆 + 冰架多边形，用于过滤陆地/冰架区域的误报。\n"
+            "下载: https://nsidc.org/data/nsidc-0709"
+        )
+    )
+    geo_grp.add_argument(
+        "--geo_overlap_thresh", type=float, default=0.5,
+        help="预测掩膜与陆地/冰架重叠比例超过此值时丢弃（默认 0.5）"
+    )
+
     return parser.parse_args()
 
 
@@ -667,6 +967,9 @@ def main():
         visualize=not args.no_vis,
         max_area_px=args.max_area_px,
         border_touch_area=args.border_touch_area,
+        scene_meta_path=args.scene_meta,
+        boundary_shp_path=args.boundary_shp,
+        geo_overlap_thresh=args.geo_overlap_thresh,
         compare=args.compare,
     )
 
