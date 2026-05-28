@@ -299,28 +299,36 @@ python inference.py --input data/raw/sar/new_scene.tif --output outputs/predicti
 **方案B：地理边界过滤**（精确，需 MEaSUREs shapefile + scene_meta.json）
 - 将南极海岸线/冰架边界栅格化到每个 patch 的像素坐标系，按重叠比例过滤
 
-#### 测试结果
+#### 测试结果（val_precision 使用 score_thresh=0.3 固定阈值，P@0.50 取 PR 曲线最优 F1 点）
 
-| 过滤参数 | AP50 | Precision | Recall | F1 |
-|---------|------|-----------|--------|-----|
-| 无过滤（训练时） | 0.6485 | 0.3531 | 0.8201 | 0.4937 |
-| max_area=50000, border=10000（过严） | 0.5101 | **0.6532** | 0.5707 | 0.6092 |
-| max_area=150000, border=30000（进行中） | — | — | — | — |
+| 过滤参数 | 移除预测数 | AP50 | val_precision | val_recall | val_f1 |
+|---------|-----------|------|--------------|------------|--------|
+| 无过滤（训练监控时） | — | 0.6485 | 0.3531 | 0.8201 | 0.4937 |
+| max_area=50000, border=10000 | 大量 | 0.5101 | — | — | — |
+| max_area=150000, border=30000 | **32/34088（0.09%）** | 0.4662 | 0.3501 | 0.6623 | 0.4580 |
 
-**结论**：严格过滤（50000/10000）Precision +0.30，但 Recall 损失 −0.25，说明部分大型真实冰山被误杀。宽松版本测试中。
+> 注：两次过滤测试使用不同随机子集（400 样本），AP50 基线不同，不可直接对比绝对值。
 
-#### 评估脚本注意事项
+#### 关键结论：启发式过滤对本问题基本无效
 
-- `evaluate.py` 当前将所有预测掩膜存入内存再算指标，Focal Loss 模型预测框极多（每图 ~200 个），需加 `--max_eval_samples` 控制样本数防 OOM
-- `compute_ap_at_iou()` 用 Python 嵌套循环计算 IoU 矩阵，400 样本约耗时 15 分钟；待优化为向量化版本
-- 推理结果保存在 `outputs/predictions/eval_val_mask_rcnn_filtered.csv`
+宽松参数（150000/30000）仅移除 32 个预测（0.09%），指标几乎无变化（+0.0000）。
+这说明**误检的冰架/冰川并非少数特别大的连片区域**，而是大量尺寸正常、不靠边缘的假阳性，与真实冰山在外观上无法区分。
 
-#### 下一步
+**根本原因**：模型只看局部 512×512 patch，完全没有"这块冰是否漂浮在开阔水域"的地理上下文。
 
-1. 等宽松参数（150000/30000）结果出来，找 Precision/Recall 平衡点
-2. 在 Colab 运行 `data_prep/export_scene_meta.py` 生成场景地理元数据
-3. 下载 MEaSUREs NSIDC-0709 边界 shapefile，启用精确地理过滤
-4. 从训练数据层面增加冰架/冰川区域的硬负样本
+#### 有效解决路径（优先级排序）
+
+1. **地理边界过滤**（最直接）：使用 MEaSUREs 南极边界精确裁掉陆地/冰架区域的预测
+   - 需要：在 Colab 运行 `data_prep/export_scene_meta.py` → 生成 `data/scene_meta.json`
+   - 需要：下载 NSIDC-0709 `Coastline_high_res_polygon.shp` 上传到服务器
+2. **硬负样本挖掘**（治本）：在 `prepare_dataset.py` 中专门从冰架/冰川密集区切取背景 patch 加入训练集
+3. **多类别检测**：将冰山/冰架/背景设为三类，让模型学会区分
+
+#### 评估脚本已知问题
+
+- **内存**：`evaluate.py` 将所有预测掩膜存入内存再算指标；Focal Loss 模型每图约 85 个预测框，400 样本占 ~77GB RAM。需加 `--max_eval_samples` 控制
+- **速度**：`compute_ap_at_iou()` 用 Python 嵌套循环，400 样本约耗时 15 分钟；待替换为 `InstanceMetricsAccumulator` 的向量化版本
+- **服务器环境**：Python 路径需 `conda activate ice-binary`，项目无 `.git`（用 scp 同步代码）
 
 ---
 
