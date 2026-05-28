@@ -18,7 +18,7 @@
 
 因此：
 - 不要建议在本地执行任何 `python` 命令
-- 代码改动后 git push，再 SSH 到服务器 git pull 同步
+- 代码改动后 git push，再 SSH/MCP 到服务器 git pull 同步
 - 报错信息和运行日志来自云端，粘贴到本地对话后再分析修复
 
 ## 环境（云端）
@@ -271,6 +271,59 @@ python inference.py --input data/raw/sar/new_scene.tif --output outputs/predicti
 
 ---
 
+## 实验记录
+
+### 训练实验对比（验证集，2026-05）
+
+| # | 方案 | AP50 | Recall | Precision | F1 | 权重路径 |
+|---|------|------|--------|-----------|-----|---------|
+| 1 | Mask R-CNN 基线（TV滤波数据） | 0.6120 | 0.7470 | 0.5166 | 0.6108 | `outputs/checkpoints/best_model.pth` |
+| 2 | + Copy-Paste 增强 | 0.6208 | 0.7283 | 0.5438 | 0.6227 | — |
+| 3 | + Copy-Paste + ConvNeXt 骨干 | 0.6076 | 0.6988 | 0.5601 | 0.6218 | — |
+| 4 | + Copy-Paste + Focal Loss | **0.6485** | **0.8201** | 0.3531 | 0.4937 | `outputs/checkpoints/exp_focal_loss/best_model.pth` |
+
+**现象**：实验4 Recall 最高但 Precision 极低（0.35），模型将大量冰川/冰架误检为冰山。
+
+---
+
+### 后处理过滤实验（2026-05-28，实验4权重，验证集 400 样本）
+
+**背景**：Precision 低的根本原因是模型缺乏地理上下文，无法区分孤立漂浮冰山与冰架/冰川边缘（SAR 局部纹理相近）。
+
+已实现两类过滤方案（`evaluate.py --compare`）：
+
+**方案A：启发式过滤**（无需外部数据）
+- `--max_area_px`：掩膜面积超过阈值 → 丢弃（冰架面积远超最大冰山）
+- `--border_touch_area`：触碰 patch 边缘且面积超过阈值 → 丢弃
+
+**方案B：地理边界过滤**（精确，需 MEaSUREs shapefile + scene_meta.json）
+- 将南极海岸线/冰架边界栅格化到每个 patch 的像素坐标系，按重叠比例过滤
+
+#### 测试结果
+
+| 过滤参数 | AP50 | Precision | Recall | F1 |
+|---------|------|-----------|--------|-----|
+| 无过滤（训练时） | 0.6485 | 0.3531 | 0.8201 | 0.4937 |
+| max_area=50000, border=10000（过严） | 0.5101 | **0.6532** | 0.5707 | 0.6092 |
+| max_area=150000, border=30000（进行中） | — | — | — | — |
+
+**结论**：严格过滤（50000/10000）Precision +0.30，但 Recall 损失 −0.25，说明部分大型真实冰山被误杀。宽松版本测试中。
+
+#### 评估脚本注意事项
+
+- `evaluate.py` 当前将所有预测掩膜存入内存再算指标，Focal Loss 模型预测框极多（每图 ~200 个），需加 `--max_eval_samples` 控制样本数防 OOM
+- `compute_ap_at_iou()` 用 Python 嵌套循环计算 IoU 矩阵，400 样本约耗时 15 分钟；待优化为向量化版本
+- 推理结果保存在 `outputs/predictions/eval_val_mask_rcnn_filtered.csv`
+
+#### 下一步
+
+1. 等宽松参数（150000/30000）结果出来，找 Precision/Recall 平衡点
+2. 在 Colab 运行 `data_prep/export_scene_meta.py` 生成场景地理元数据
+3. 下载 MEaSUREs NSIDC-0709 边界 shapefile，启用精确地理过滤
+4. 从训练数据层面增加冰架/冰川区域的硬负样本
+
+---
+
 ## Colab 常见问题
 
 ### Google Drive 挂载断开（errno=107）
@@ -297,12 +350,3 @@ TIFFFillTile:Read error ... got N bytes, expected M
 
 文件在 GEE 下载时损坏或不完整。代码已自动跳过该场景（`err_no=1` 为警告级别）。修复方法：在 GEE 重新导出该 grid 文件。
 
----
-
-## 已知问题 / 待办
-
-- 当前数据量不足导致 `val_recall=0.38`，瓶颈是数据量而非模型设计；需补充覆盖冰山密集区的 SAR 场景后重新运行预处理。
-- 新版可视化（overview + zoom 两文件）尚未在云端验证，下次推理后确认输出是否正常。
-- `spatial_buffer_m: 0`（正式设置），测试时可临时调大以验证管道是否通畅。
-- 离线 RTV（`tv_smooth.enabled: true`）尚未在全量数据上验证效果，仍设为 false；建议先在单个场景测试平滑效果再开启。
-- `--resume` 只保留了 best_model.pth，断点续训仍可用但会从最佳 epoch 继续而非最后 epoch。
